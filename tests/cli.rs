@@ -487,3 +487,19 @@ fn works_when_the_global_thread_pool_is_tiny() {
     assert.success().stdout(contains("4 new"));
     assert_eq!(snapshot(&env.target()), snapshot(&env.source()));
 }
+
+#[test]
+fn jobs_flag_controls_parallel_copies() {
+    // given
+    let env = Env::new();
+    sample_tree(&env.source());
+
+    // when
+    let single = env.command().args(["--jobs", "1"]).assert();
+    let zero = env.command().args(["--jobs", "0"]).assert();
+
+    // then
+    single.success().stdout(contains("4 new"));
+    zero.code(2);
+    assert_eq!(snapshot(&env.target()), snapshot(&env.source()));
+}

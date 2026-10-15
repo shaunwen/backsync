@@ -4,12 +4,12 @@ use std::io;
 use std::os::unix::fs::symlink;
 use std::path::{Component, Path, PathBuf};
 use std::process;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use filetime::FileTime;
 use rayon::prelude::*;
 
-use crate::plan::{CopyReason, Plan};
+use crate::plan::{CopyAction, CopyReason, Plan};
 use crate::scan::Entry;
 
 const TEMP_PREFIX: &str = ".backsync-tmp";
@@ -58,6 +58,7 @@ pub struct SyncError {
 pub struct Outcome {
     pub removed: usize,
     pub removals_skipped: usize,
+    pub not_attempted: usize,
     pub created_dirs: usize,
     pub copied_new: usize,
     pub updated: usize,
@@ -67,6 +68,15 @@ pub struct Outcome {
 
 pub struct Options {
     pub allow_delete: bool,
+    pub jobs: usize,
+}
+
+type Copier<'a> = dyn Fn(&CopyAction) -> io::Result<u64> + Sync + 'a;
+
+enum CopyResult {
+    Done(CopyReason, u64),
+    Failed(SyncError),
+    NotAttempted,
 }
 
 pub fn execute(
@@ -76,10 +86,28 @@ pub fn execute(
     options: &Options,
     on_event: &(dyn Fn(Event) + Sync),
 ) -> Outcome {
+    let copier = |action: &CopyAction| copy_entry(source_root, target, &action.path, &action.entry);
+    let run = || execute_with(plan, target, options.allow_delete, on_event, &copier);
+    match rayon::ThreadPoolBuilder::new()
+        .num_threads(options.jobs.max(1))
+        .build()
+    {
+        Ok(pool) => pool.install(run),
+        Err(_) => run(),
+    }
+}
+
+fn execute_with(
+    plan: &Plan,
+    target: &TargetRoot,
+    allow_delete: bool,
+    on_event: &(dyn Fn(Event) + Sync),
+    copier: &Copier,
+) -> Outcome {
     let mut outcome = Outcome::default();
     let mut blocked: HashSet<&Path> = HashSet::new();
 
-    if options.allow_delete {
+    if allow_delete {
         let failures: Vec<(&Path, SyncError)> = plan
             .remove
             .par_iter()
@@ -120,33 +148,53 @@ pub fn execute(
         }
     }
 
-    let results: Vec<Result<(CopyReason, u64), SyncError>> = plan
+    let target_full = AtomicBool::new(false);
+    let results: Vec<CopyResult> = plan
         .copy
         .par_iter()
         .map(|action| {
-            if let Some(error) = blocked_error(&blocked, &action.path, "copy") {
-                return Err(error);
+            if target_full.load(Ordering::Relaxed) {
+                return CopyResult::NotAttempted;
             }
-            let bytes = copy_entry(source_root, target, &action.path, &action.entry)
-                .map_err(|error| failure(&action.path, "copy", &error))?;
-            on_event(Event::Copied(&action.path, action.reason));
-            Ok((action.reason, bytes))
+            if let Some(error) = blocked_error(&blocked, &action.path, "copy") {
+                return CopyResult::Failed(error);
+            }
+            match copier(action) {
+                Ok(bytes) => {
+                    on_event(Event::Copied(&action.path, action.reason));
+                    CopyResult::Done(action.reason, bytes)
+                }
+                Err(error) => {
+                    if is_out_of_space(&error) {
+                        target_full.store(true, Ordering::Relaxed);
+                    }
+                    CopyResult::Failed(failure(&action.path, "copy", &error))
+                }
+            }
         })
         .collect();
     for result in results {
         match result {
-            Ok((CopyReason::New, bytes)) => {
+            CopyResult::Done(CopyReason::New, bytes) => {
                 outcome.copied_new += 1;
                 outcome.bytes += bytes;
             }
-            Ok((CopyReason::Changed, bytes)) => {
+            CopyResult::Done(CopyReason::Changed, bytes) => {
                 outcome.updated += 1;
                 outcome.bytes += bytes;
             }
-            Err(error) => outcome.errors.push(error),
+            CopyResult::Failed(error) => outcome.errors.push(error),
+            CopyResult::NotAttempted => outcome.not_attempted += 1,
         }
     }
     outcome
+}
+
+fn is_out_of_space(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::StorageFull | io::ErrorKind::QuotaExceeded
+    )
 }
 
 fn remove(target: &TargetRoot, relative: &Path) -> io::Result<()> {
@@ -218,7 +266,6 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use super::*;
-    use crate::plan::CopyAction;
 
     struct Fixture {
         _dir: tempfile::TempDir,
@@ -245,7 +292,10 @@ mod tests {
                 plan,
                 &self.source,
                 &TargetRoot::new(self.target.clone()),
-                &Options { allow_delete },
+                &Options {
+                    allow_delete,
+                    jobs: 2,
+                },
                 &|_| {},
             )
         }
@@ -457,6 +507,48 @@ mod tests {
     }
 
     #[test]
+    fn full_target_stops_further_copies() {
+        // given
+        let fx = Fixture::new();
+        let plan = Plan {
+            copy: ["a", "b", "c", "d"]
+                .map(|p| file_action(p, CopyReason::New))
+                .to_vec(),
+            ..Plan::default()
+        };
+        let attempts = Mutex::new(Vec::new());
+        let copier = |action: &CopyAction| {
+            attempts.lock().unwrap().push(action.path.clone());
+            if action.path == Path::new("a") {
+                Ok(1)
+            } else {
+                Err(io::Error::from(io::ErrorKind::StorageFull))
+            }
+        };
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+
+        // when
+        let outcome = pool.install(|| {
+            execute_with(
+                &plan,
+                &TargetRoot::new(fx.target.clone()),
+                true,
+                &|_| {},
+                &copier,
+            )
+        });
+
+        // then
+        assert_eq!(outcome.copied_new, 1);
+        assert_eq!(outcome.errors.len(), 1);
+        assert_eq!(outcome.not_attempted, 2);
+        assert_eq!(attempts.into_inner().unwrap().len(), 2);
+    }
+
+    #[test]
     fn copy_errors_are_collected_and_other_copies_continue() {
         // given
         let fx = Fixture::new();
@@ -518,7 +610,10 @@ mod tests {
             &plan,
             &fx.source,
             &TargetRoot::new(fx.target.clone()),
-            &Options { allow_delete: true },
+            &Options {
+                allow_delete: true,
+                jobs: 2,
+            },
             &|event| events.lock().unwrap().push(format!("{event:?}")),
         );
 

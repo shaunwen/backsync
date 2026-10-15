@@ -57,6 +57,12 @@ pub fn summary(outcome: &Outcome, unchanged: usize, elapsed: Duration) -> String
             outcome.removals_skipped
         ));
     }
+    if outcome.not_attempted > 0 {
+        text.push_str(&format!(
+            "; {} copies not attempted because the target is full",
+            outcome.not_attempted
+        ));
+    }
     if !outcome.errors.is_empty() {
         text.push_str(&format!("; {} errors", outcome.errors.len()));
     }
@@ -165,6 +171,7 @@ mod tests {
             copied_new: 2,
             updated: 1,
             removals_skipped: 3,
+            not_attempted: 5,
             bytes: 2048,
             errors: vec![crate::sync::SyncError {
                 path: "x".into(),
@@ -181,7 +188,8 @@ mod tests {
         assert_eq!(
             text,
             "2 new, 1 updated, 0 removed, 10 unchanged; 2.0 KiB copied in 1.50s; \
-             3 removals skipped because the source could not be fully read; 1 errors"
+             3 removals skipped because the source could not be fully read; \
+             5 copies not attempted because the target is full; 1 errors"
         );
     }
 

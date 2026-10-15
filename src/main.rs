@@ -40,6 +40,10 @@ struct Cli {
     /// Allow syncing an empty source, which empties the target
     #[arg(long)]
     allow_empty_source: bool,
+
+    /// Parallel copy jobs; lower it for spinning disks [default: `jobs` in config, else 4]
+    #[arg(short, long, value_name = "N", value_parser = clap::value_parser!(u16).range(1..))]
+    jobs: Option<u16>,
 }
 
 enum Status {
@@ -105,7 +109,10 @@ fn run(cli: &Cli) -> Result<Status> {
         &plan,
         &config.source,
         &TargetRoot::new(config.target.clone()),
-        &sync::Options { allow_delete },
+        &sync::Options {
+            allow_delete,
+            jobs: cli.jobs.map_or(config.jobs, usize::from),
+        },
         &|event| {
             if verbose {
                 println!("{}", report::event_line(event));

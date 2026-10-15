@@ -8,6 +8,7 @@ use serde::Deserialize;
 pub const SOURCE_ENV: &str = "BACKSYNC_SOURCE";
 pub const TARGET_ENV: &str = "BACKSYNC_TARGET";
 const DEFAULT_MODIFY_WINDOW_SECS: u64 = 2;
+const DEFAULT_JOBS: usize = 4;
 
 #[derive(Debug, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -15,6 +16,7 @@ pub struct FileConfig {
     pub source: Option<String>,
     pub target: Option<String>,
     pub modify_window_secs: Option<u64>,
+    pub jobs: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -22,6 +24,7 @@ pub struct Config {
     pub source: PathBuf,
     pub target: PathBuf,
     pub modify_window: Duration,
+    pub jobs: usize,
 }
 
 pub fn default_config_path(env: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
@@ -50,6 +53,10 @@ pub fn resolve(file: FileConfig, env: impl Fn(&str) -> Option<String>) -> Result
             })?;
         Ok(expand_tilde(&raw, home.as_deref()))
     };
+    let jobs = file.jobs.unwrap_or(DEFAULT_JOBS);
+    if jobs == 0 {
+        bail!("`jobs` in the config file must be at least 1");
+    }
     Ok(Config {
         source: pick(SOURCE_ENV, file.source, "source")?,
         target: pick(TARGET_ENV, file.target, "target")?,
@@ -57,6 +64,7 @@ pub fn resolve(file: FileConfig, env: impl Fn(&str) -> Option<String>) -> Result
             file.modify_window_secs
                 .unwrap_or(DEFAULT_MODIFY_WINDOW_SECS),
         ),
+        jobs,
     })
 }
 
@@ -134,6 +142,7 @@ mod tests {
             source: Some(source.into()),
             target: Some(target.into()),
             modify_window_secs: None,
+            jobs: None,
         }
     }
 
@@ -226,6 +235,24 @@ mod tests {
     }
 
     #[test]
+    fn jobs_default_to_four_and_zero_is_rejected() {
+        // given
+        let default_file = file_config("/a", "/b");
+        let zero_file = FileConfig {
+            jobs: Some(0),
+            ..file_config("/a", "/b")
+        };
+
+        // when
+        let default_config = resolve(default_file, env_of(&[])).unwrap();
+        let zero = resolve(zero_file, env_of(&[]));
+
+        // then
+        assert_eq!(default_config.jobs, 4);
+        assert!(zero.is_err());
+    }
+
+    #[test]
     fn default_config_path_prefers_xdg_config_home() {
         // given
         let env = env_of(&[("XDG_CONFIG_HOME", "/xdg"), ("HOME", "/Users/me")]);
@@ -303,6 +330,7 @@ mod tests {
             source: source.to_path_buf(),
             target: target.to_path_buf(),
             modify_window: Duration::from_secs(2),
+            jobs: 4,
         }
     }
 
