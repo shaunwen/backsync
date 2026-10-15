@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use jwalk::WalkDirGeneric;
+use jwalk::{Parallelism, WalkDirGeneric};
 
 pub const VOLUME_METADATA: &[&str] = &[
     ".Spotlight-V100",
@@ -44,9 +44,10 @@ enum Probe {
 
 type Walker = WalkDirGeneric<((), Probe)>;
 
-pub fn scan(root: &Path) -> Scan {
+pub fn scan(root: &Path, threads: usize) -> Scan {
     let walk_root = root.to_path_buf();
     let walker = Walker::new(root)
+        .parallelism(Parallelism::RayonNewPool(threads))
         .skip_hidden(false)
         .follow_links(false)
         .sort(false)
@@ -153,7 +154,7 @@ mod tests {
         fs::create_dir(root.path().join("empty")).unwrap();
 
         // when
-        let scan = scan(root.path());
+        let scan = scan(root.path(), 4);
 
         // then
         assert!(scan.errors.is_empty());
@@ -175,7 +176,7 @@ mod tests {
         write(root.path(), ".hidden/.env", "x");
 
         // when
-        let scan = scan(root.path());
+        let scan = scan(root.path(), 4);
 
         // then
         assert!(scan.entries.contains_key(Path::new(".hidden/.env")));
@@ -189,7 +190,7 @@ mod tests {
         symlink("real", root.path().join("link")).unwrap();
 
         // when
-        let scan = scan(root.path());
+        let scan = scan(root.path(), 4);
 
         // then
         assert_eq!(
@@ -210,7 +211,7 @@ mod tests {
         write(root.path(), "project/.Trashes/kept", "x");
 
         // when
-        let scan = scan(root.path());
+        let scan = scan(root.path(), 4);
 
         // then
         assert!(
@@ -233,7 +234,7 @@ mod tests {
         let _listener = UnixListener::bind(root.path().join("sock")).unwrap();
 
         // when
-        let scan = scan(root.path());
+        let scan = scan(root.path(), 4);
 
         // then
         assert_eq!(scan.skipped_special, vec![PathBuf::from("sock")]);
@@ -249,7 +250,7 @@ mod tests {
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
 
         // when
-        let scan = scan(root.path());
+        let scan = scan(root.path(), 4);
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
 
         // then
@@ -266,7 +267,7 @@ mod tests {
         fs::set_permissions(&root, fs::Permissions::from_mode(0o000)).unwrap();
 
         // when
-        let scan = scan(&root);
+        let scan = scan(&root, 4);
         fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
 
         // then

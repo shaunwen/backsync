@@ -473,3 +473,17 @@ fn many_files_sync_and_resync() {
     second.success().stdout(contains("1000 unchanged"));
     assert_eq!(snapshot(&env.target()), snapshot(&env.source()));
 }
+
+#[test]
+fn works_when_the_global_thread_pool_is_tiny() {
+    // given
+    let env = Env::new();
+    sample_tree(&env.source());
+
+    // when
+    let assert = env.command().env("RAYON_NUM_THREADS", "1").assert();
+
+    // then
+    assert.success().stdout(contains("4 new"));
+    assert_eq!(snapshot(&env.target()), snapshot(&env.source()));
+}

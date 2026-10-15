@@ -1,6 +1,7 @@
 use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::thread;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
@@ -62,7 +63,12 @@ fn run(cli: &Cli) -> Result<Status> {
     let config = load_config(cli)?;
     let started = Instant::now();
 
-    let (source, target) = rayon::join(|| scan(&config.source), || scan(&config.target));
+    let threads = thread::available_parallelism().map_or(4, |n| n.get());
+    let (source, target) = thread::scope(|s| {
+        let target = s.spawn(|| scan(&config.target, threads));
+        let source = scan(&config.source, threads);
+        (source, target.join().expect("target scan thread panicked"))
+    });
     if source.entries.is_empty() && !target.entries.is_empty() && !cli.allow_empty_source {
         bail!(
             "source {} is empty but the backup is not; refusing to empty the backup \
