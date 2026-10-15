@@ -1,0 +1,368 @@
+use std::collections::{HashMap, HashSet};
+use std::mem::discriminant;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
+
+use rayon::prelude::*;
+
+use crate::scan::Entry;
+
+pub type Entries = HashMap<PathBuf, Entry>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compare {
+    Metadata { modify_window: Duration },
+    Content,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyReason {
+    New,
+    Changed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyAction {
+    pub path: PathBuf,
+    pub entry: Entry,
+    pub reason: CopyReason,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Plan {
+    pub remove: Vec<PathBuf>,
+    pub mkdir: Vec<PathBuf>,
+    pub copy: Vec<CopyAction>,
+    pub unchanged: usize,
+}
+
+impl Plan {
+    pub fn is_empty(&self) -> bool {
+        self.remove.is_empty() && self.mkdir.is_empty() && self.copy.is_empty()
+    }
+}
+
+enum Verdict {
+    Unchanged,
+    Copy(CopyAction),
+    Mkdir(PathBuf),
+    DirExists,
+}
+
+pub fn diff(
+    source: &Entries,
+    target: &Entries,
+    compare: Compare,
+    same_content: impl Fn(&Path) -> bool + Sync,
+) -> Plan {
+    let verdicts: Vec<Verdict> = source
+        .par_iter()
+        .map(|(path, entry)| judge(path, entry, target.get(path), compare, &same_content))
+        .collect();
+
+    let mut plan = Plan {
+        remove: topmost(
+            target
+                .iter()
+                .filter(|(path, entry)| {
+                    source
+                        .get(*path)
+                        .is_none_or(|src| discriminant(src) != discriminant(*entry))
+                })
+                .map(|(path, _)| path.clone())
+                .collect(),
+        ),
+        ..Plan::default()
+    };
+    for verdict in verdicts {
+        match verdict {
+            Verdict::Unchanged => plan.unchanged += 1,
+            Verdict::Copy(action) => plan.copy.push(action),
+            Verdict::Mkdir(path) => plan.mkdir.push(path),
+            Verdict::DirExists => {}
+        }
+    }
+    plan.remove.sort();
+    plan.mkdir.sort();
+    plan.copy.sort_by(|a, b| a.path.cmp(&b.path));
+    plan
+}
+
+fn judge(
+    path: &Path,
+    entry: &Entry,
+    existing: Option<&Entry>,
+    compare: Compare,
+    same_content: &(impl Fn(&Path) -> bool + Sync),
+) -> Verdict {
+    let copy = |reason| {
+        Verdict::Copy(CopyAction {
+            path: path.to_path_buf(),
+            entry: entry.clone(),
+            reason,
+        })
+    };
+    match (entry, existing) {
+        (Entry::Dir, Some(Entry::Dir)) => Verdict::DirExists,
+        (Entry::Dir, _) => Verdict::Mkdir(path.to_path_buf()),
+        (_, None) => copy(CopyReason::New),
+        (
+            Entry::Symlink { link },
+            Some(Entry::Symlink {
+                link: existing_link,
+            }),
+        ) => {
+            if link == existing_link {
+                Verdict::Unchanged
+            } else {
+                copy(CopyReason::Changed)
+            }
+        }
+        (
+            Entry::File { size, mtime },
+            Some(Entry::File {
+                size: existing_size,
+                mtime: existing_mtime,
+            }),
+        ) => {
+            let same = size == existing_size
+                && match compare {
+                    Compare::Metadata { modify_window } => {
+                        within(*mtime, *existing_mtime, modify_window)
+                    }
+                    Compare::Content => same_content(path),
+                };
+            if same {
+                Verdict::Unchanged
+            } else {
+                copy(CopyReason::Changed)
+            }
+        }
+        _ => copy(CopyReason::Changed),
+    }
+}
+
+fn within(a: SystemTime, b: SystemTime, window: Duration) -> bool {
+    let gap = a.duration_since(b).unwrap_or_else(|e| e.duration());
+    gap <= window
+}
+
+fn topmost(candidates: Vec<PathBuf>) -> Vec<PathBuf> {
+    let set: HashSet<&Path> = candidates.iter().map(PathBuf::as_path).collect();
+    candidates
+        .iter()
+        .filter(|path| !path.ancestors().skip(1).any(|a| set.contains(a)))
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const WINDOW: Compare = Compare::Metadata {
+        modify_window: Duration::from_secs(2),
+    };
+
+    fn at(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    fn file(size: u64, secs: u64) -> Entry {
+        Entry::File {
+            size,
+            mtime: at(secs),
+        }
+    }
+
+    fn link(to: &str) -> Entry {
+        Entry::Symlink { link: to.into() }
+    }
+
+    fn entries(items: &[(&str, Entry)]) -> Entries {
+        items
+            .iter()
+            .map(|(path, entry)| (PathBuf::from(path), entry.clone()))
+            .collect()
+    }
+
+    fn paths(items: &[&str]) -> Vec<PathBuf> {
+        items.iter().map(PathBuf::from).collect()
+    }
+
+    fn copied(plan: &Plan) -> Vec<(PathBuf, CopyReason)> {
+        plan.copy
+            .iter()
+            .map(|c| (c.path.clone(), c.reason))
+            .collect()
+    }
+
+    fn never_called(_: &Path) -> bool {
+        panic!("content comparison must not run")
+    }
+
+    #[test]
+    fn identical_trees_produce_an_empty_plan() {
+        // given
+        let tree = entries(&[("d", Entry::Dir), ("d/a", file(3, 100)), ("l", link("d"))]);
+
+        // when
+        let plan = diff(&tree, &tree, WINDOW, never_called);
+
+        // then
+        assert!(plan.is_empty());
+        assert_eq!(plan.unchanged, 2);
+    }
+
+    #[test]
+    fn missing_files_and_dirs_are_created() {
+        // given
+        let source = entries(&[
+            ("d", Entry::Dir),
+            ("d/e", Entry::Dir),
+            ("d/e/a", file(1, 1)),
+        ]);
+
+        // when
+        let plan = diff(&source, &Entries::new(), WINDOW, never_called);
+
+        // then
+        assert_eq!(plan.mkdir, paths(&["d", "d/e"]));
+        assert_eq!(copied(&plan), vec![("d/e/a".into(), CopyReason::New)]);
+        assert!(plan.remove.is_empty());
+    }
+
+    #[test]
+    fn size_change_is_copied() {
+        // given
+        let source = entries(&[("a", file(2, 100))]);
+        let target = entries(&[("a", file(1, 100))]);
+
+        // when
+        let plan = diff(&source, &target, WINDOW, never_called);
+
+        // then
+        assert_eq!(copied(&plan), vec![("a".into(), CopyReason::Changed)]);
+    }
+
+    #[test]
+    fn mtime_change_beyond_window_is_copied_and_within_window_is_not() {
+        // given
+        let source = entries(&[("old", file(1, 100)), ("new", file(1, 100))]);
+        let target = entries(&[("old", file(1, 98)), ("new", file(1, 97))]);
+
+        // when
+        let plan = diff(&source, &target, WINDOW, never_called);
+
+        // then
+        assert_eq!(copied(&plan), vec![("new".into(), CopyReason::Changed)]);
+        assert_eq!(plan.unchanged, 1);
+    }
+
+    #[test]
+    fn target_newer_than_source_is_still_overwritten() {
+        // given
+        let source = entries(&[("a", file(1, 100))]);
+        let target = entries(&[("a", file(1, 500))]);
+
+        // when
+        let plan = diff(&source, &target, WINDOW, never_called);
+
+        // then
+        assert_eq!(copied(&plan), vec![("a".into(), CopyReason::Changed)]);
+    }
+
+    #[test]
+    fn content_mode_uses_comparator_only_for_same_size_files() {
+        // given
+        let source = entries(&[
+            ("same", file(1, 1)),
+            ("edited", file(1, 1)),
+            ("grown", file(9, 1)),
+        ]);
+        let target = entries(&[
+            ("same", file(1, 1)),
+            ("edited", file(1, 1)),
+            ("grown", file(1, 1)),
+        ]);
+
+        // when
+        let plan = diff(&source, &target, Compare::Content, |path| {
+            assert_ne!(path, Path::new("grown"));
+            path == Path::new("same")
+        });
+
+        // then
+        assert_eq!(
+            copied(&plan),
+            vec![
+                ("edited".into(), CopyReason::Changed),
+                ("grown".into(), CopyReason::Changed)
+            ]
+        );
+        assert_eq!(plan.unchanged, 1);
+    }
+
+    #[test]
+    fn extraneous_target_entries_are_removed_topmost_only() {
+        // given
+        let source = entries(&[("keep", file(1, 1))]);
+        let target = entries(&[
+            ("keep", file(1, 1)),
+            ("gone.txt", file(1, 1)),
+            ("old", Entry::Dir),
+            ("old/inner", Entry::Dir),
+            ("old/inner/x", file(1, 1)),
+        ]);
+
+        // when
+        let plan = diff(&source, &target, WINDOW, never_called);
+
+        // then
+        assert_eq!(plan.remove, paths(&["gone.txt", "old"]));
+    }
+
+    #[test]
+    fn type_change_removes_then_recreates() {
+        // given
+        let source = entries(&[
+            ("was_dir", file(1, 1)),
+            ("was_file", Entry::Dir),
+            ("was_link", file(1, 1)),
+        ]);
+        let target = entries(&[
+            ("was_dir", Entry::Dir),
+            ("was_dir/child", file(1, 1)),
+            ("was_file", file(1, 1)),
+            ("was_link", link("elsewhere")),
+        ]);
+
+        // when
+        let plan = diff(&source, &target, WINDOW, never_called);
+
+        // then
+        assert_eq!(plan.remove, paths(&["was_dir", "was_file", "was_link"]));
+        assert_eq!(plan.mkdir, paths(&["was_file"]));
+        assert_eq!(
+            copied(&plan),
+            vec![
+                ("was_dir".into(), CopyReason::Changed),
+                ("was_link".into(), CopyReason::Changed)
+            ]
+        );
+    }
+
+    #[test]
+    fn retargeted_symlink_is_replaced_without_removal() {
+        // given
+        let source = entries(&[("l", link("new"))]);
+        let target = entries(&[("l", link("old"))]);
+
+        // when
+        let plan = diff(&source, &target, WINDOW, never_called);
+
+        // then
+        assert!(plan.remove.is_empty());
+        assert_eq!(copied(&plan), vec![("l".into(), CopyReason::Changed)]);
+    }
+}
