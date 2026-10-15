@@ -1,6 +1,6 @@
 # backsync
 
-Mirror a folder to a backup folder, for example a portable drive. New and changed files are copied, files deleted from the source are deleted from the backup, and unchanged files are left alone. The source is never modified.
+Mirror folders to backup folders, for example on a portable drive. New and changed files are copied, files deleted from the source are deleted from the backup, and unchanged files are left alone. The source is never modified.
 
 ```text
 $ backsync
@@ -16,18 +16,26 @@ make install BIN_DIR=~/bin
 
 ## Configure
 
-Set the source and target in `~/.config/backsync/config.toml` (or `$XDG_CONFIG_HOME/backsync/config.toml`):
+Define one named section per backup in `~/.config/backsync/config.toml` (or `$XDG_CONFIG_HOME/backsync/config.toml`):
 
 ```toml
-source = "~/Documents"
-target = "/Volumes/Backup/Documents"
-
-# optional
+# optional defaults for every backup
 modify_window_secs = 2   # mtime difference still treated as unchanged
 jobs = 4                 # parallel copies; use 1-2 for spinning disks
+
+[backup.books]
+source = "~/Documents/Books"
+target = "/Volumes/myDrive/Books"
+
+[backup.personal]
+source = "~/Documents/personal"
+target = "/Volumes/myDrive/personal"
+jobs = 2                 # per-backup override
 ```
 
-Or with environment variables, which take priority over the file field by field:
+For a single backup you can skip the sections and write `source` and `target` at the top level instead (not both styles in one file).
+
+For a one-off run, environment variables define a single pair and take priority over the file; named sections are ignored for that run:
 
 ```bash
 BACKSYNC_SOURCE=~/Documents BACKSYNC_TARGET=/Volumes/Backup/Documents backsync
@@ -36,7 +44,9 @@ BACKSYNC_SOURCE=~/Documents BACKSYNC_TARGET=/Volumes/Backup/Documents backsync
 ## Use
 
 ```bash
-backsync                 # sync
+backsync                 # run every backup, in file order
+backsync personal        # run only [backup.personal]
+backsync books personal  # run these two
 backsync -n              # dry run: list what would change
 backsync -v              # print each action
 backsync --checksum      # compare contents, not just size and mtime
@@ -44,11 +54,13 @@ backsync -j 2            # fewer parallel copies
 backsync --config PATH   # another config file
 ```
 
-| Exit code | Meaning |
+Each named backup prints a `[name] source -> target` header and its own summary. When several run, a last line reports each result, e.g. `books ok, personal not run`. A backup that cannot run (its drive is not mounted, a safety check refuses) does not stop the others.
+
+| Exit code | Meaning (the worst result across all backups that ran) |
 |-----------|---------|
-| 0 | backup matches the source |
+| 0 | every backup matches its source |
 | 1 | finished, but some files could not be read, copied or removed (listed on stderr) |
-| 2 | nothing was changed: configuration problem or a safety check refused to run |
+| 2 | a backup was not run (drive missing, safety check), or the configuration or a backup name is invalid, in which case nothing runs |
 
 ## How it decides
 
@@ -56,6 +68,7 @@ backsync --config PATH   # another config file
 - Copied files get the source's modification time, so the next run sees them as unchanged.
 - Files are written to a temporary name and renamed into place, so an interrupted run never leaves a half-written file under the real name. Leftover temp files are removed on the next run.
 - Symlinks are copied as links, never followed. Sockets and other special files are skipped with a warning.
+- Renames are not detected: a renamed file is copied under its new name and the old name is removed from the backup.
 
 ## Safety
 
