@@ -23,7 +23,8 @@
 backsync                 # sync using env / config
 backsync --dry-run       # print what would happen, change nothing
 backsync --verbose       # print every action taken
-backsync --checksum      # compare file contents (blake3) instead of size + mtime
+backsync --checksum      # compare file contents instead of size + mtime
+backsync --jobs N        # parallel copy jobs (default 4)
 backsync --config PATH   # use a config file other than the default
 ```
 
@@ -34,6 +35,8 @@ source = "~/Documents"
 target = "/Volumes/Backup/Documents"
 # optional, seconds of mtime difference still treated as "same file" (default 2)
 modify_window_secs = 2
+# optional, parallel copy jobs (default 4); --jobs overrides it
+jobs = 4
 ```
 
 Env overrides: `BACKSYNC_SOURCE`, `BACKSYNC_TARGET`. A leading `~/` is expanded in both.
@@ -126,11 +129,11 @@ stop
 
 Default: same size **and** mtime within `modify_window_secs` (default 2 s). This is the rsync approach and avoids reading file contents, so unchanged files cost one `stat` each. The window absorbs coarse timestamps on portable drive file systems (FAT32 stores 2 s, HFS+ 1 s, exFAT 10 ms). After every copy the target mtime is set to the source mtime, so the next run sees the file as unchanged.
 
-`--checksum`: same-size files are compared by blake3 hash of the contents, in parallel. Slower, but catches a change that kept both size and mtime.
+`--checksum`: same-size files are compared chunk by chunk, in parallel, stopping at the first difference. Slower, but catches a change that kept both size and mtime.
 
 ### Atomic replacement
 
-A file is copied to `.backsync-tmp.<name>` in the destination directory, its mtime is set, then it is renamed over the final name. An interrupted run never leaves a half-written file under the real name. Leftover temp files are not in the source, so the next run deletes them as extraneous.
+A file is copied to `.backsync-tmp.<pid>.<n>` in the destination directory (short, so long file names never exceed the 255-byte limit), its mtime is set, then it is renamed over the final name. An interrupted run never leaves a half-written file under the real name. Leftover temp files are not in the source, so the next run deletes them as extraneous.
 
 ### Deletion and type changes
 
@@ -168,7 +171,7 @@ Symlinks are copied as links (never followed), compared by link text. Sockets, F
 | `jwalk` | parallel directory walking |
 | `rayon` | parallel copy / delete / hashing |
 | `filetime` | set mtime after copy |
-| `blake3` | `--checksum` content comparison |
+| `unicode-normalization` | compare names in NFC form on macOS |
 | `anyhow` | error context in the binary |
 | `tempfile`, `assert_cmd`, `predicates` (dev) | end-to-end tests |
 
@@ -204,3 +207,19 @@ All tests follow GIVEN / WHEN / THEN.
 8. `test: end-to-end sync scenarios`
 9. `build: make install to ~/workspace/bin`
 10. `docs: README`
+
+## Changes during implementation
+
+Testing against real disk images (an APFS volume and an exFAT volume created with `hdiutil`, standing in for a portable drive) changed several decisions:
+
+| Finding | Change |
+|---------|--------|
+| `jwalk` shared the global rayon pool with the `rayon::join` running both scans; with a small pool it aborted with "thread-pool too busy" and the run copied nothing | each scan walks on its own pool; scans run on scoped threads |
+| Using every core for copies was slower: 50k files / 1.1 GiB to a separate APFS volume took 16.0 s (1 job), 9.5 s (2), 8.1 s (4), 8.0 s (8, twice the kernel time), 11.2 s (12) | copies run on a dedicated pool, `--jobs` / `jobs`, default 4 |
+| A full target produced one error per remaining file | the first out-of-space error stops further copies; the summary counts copies not attempted |
+| exFAT stores extended attributes in `._<name>` AppleDouble files, so every resync deleted thousands of them and the next copy recreated them | a target-only `._X` is kept while `X` is mirrored |
+| exFAT folder listings shift during deletion, so `remove_dir_all` left files behind ("Directory not empty") | folder removal retries until the tree is gone; an entry that has already vanished counts as removed |
+| exFAT lists names decomposed (NFD) while APFS keeps composed (NFC) names, so accented files were deleted and recopied on every run | on macOS entries are compared by NFC key; real on-disk names are kept for all IO |
+| Hashing both files with blake3 reads both files fully | chunked comparison stops at the first difference and needs no dependency |
+
+Results on the final build: a no-op resync of 50k files takes about 0.1 s (rsync: 2.8 s); a first full copy to a separate APFS volume takes 8.1 s (rsync: 17.0 s).
