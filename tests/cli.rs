@@ -6,6 +6,7 @@ use std::time::{Duration, SystemTime};
 
 use assert_cmd::Command;
 use filetime::FileTime;
+use predicates::prelude::*;
 use predicates::str::contains;
 use tempfile::TempDir;
 
@@ -565,4 +566,146 @@ fn new_backups_keep_the_source_spelling_of_names() {
         .map(|e| e.unwrap().file_name().into_string().unwrap())
         .collect();
     assert_eq!(names, vec![decomposed.to_string()]);
+}
+
+struct Library {
+    env: Env,
+}
+
+impl Library {
+    fn new() -> Self {
+        let env = Env::new();
+        for name in ["books", "photos"] {
+            write(&env.dir.path().join(name), "item.txt", name);
+            fs::create_dir_all(env.dir.path().join("drive").join(name)).unwrap();
+        }
+        let config_dir = env.dir.path().join("xdg/backsync");
+        fs::create_dir_all(&config_dir).unwrap();
+        let root = env.dir.path();
+        fs::write(
+            config_dir.join("config.toml"),
+            format!(
+                "[backup.books]\nsource = {:?}\ntarget = {:?}\n\n\
+                 [backup.photos]\nsource = {:?}\ntarget = {:?}\njobs = 1\n",
+                root.join("books"),
+                root.join("drive/books"),
+                root.join("photos"),
+                root.join("drive/photos"),
+            ),
+        )
+        .unwrap();
+        Self { env }
+    }
+
+    fn command(&self) -> Command {
+        let mut cmd = self.env.command();
+        cmd.env_remove("BACKSYNC_SOURCE")
+            .env_remove("BACKSYNC_TARGET");
+        cmd
+    }
+
+    fn backed_up(&self, name: &str) -> bool {
+        self.env
+            .dir
+            .path()
+            .join("drive")
+            .join(name)
+            .join("item.txt")
+            .exists()
+    }
+}
+
+#[test]
+fn all_named_backups_run_in_order_with_a_tally() {
+    // given
+    let library = Library::new();
+
+    // when
+    let assert = library.command().assert();
+
+    // then
+    let output = String::from_utf8(assert.success().get_output().stdout.clone()).unwrap();
+    let books = output.find("[books] ").unwrap();
+    let photos = output.find("[photos] ").unwrap();
+    assert!(books < photos);
+    assert!(output.ends_with("books ok, photos ok\n"));
+    assert!(library.backed_up("books") && library.backed_up("photos"));
+}
+
+#[test]
+fn named_backup_runs_alone() {
+    // given
+    let library = Library::new();
+
+    // when
+    let assert = library.command().arg("photos").assert();
+
+    // then
+    assert
+        .success()
+        .stdout(contains("[photos] "))
+        .stdout(contains("[books]").not());
+    assert!(library.backed_up("photos"));
+    assert!(!library.backed_up("books"));
+}
+
+#[test]
+fn failing_backup_does_not_stop_the_next_one() {
+    // given
+    let library = Library::new();
+    fs::remove_dir_all(library.env.dir.path().join("drive/books")).unwrap();
+
+    // when
+    let assert = library.command().assert();
+
+    // then
+    assert
+        .code(2)
+        .stderr(contains("[books] invalid source or target"))
+        .stdout(contains("books not run, photos ok"));
+    assert!(library.backed_up("photos"));
+}
+
+#[test]
+fn unknown_backup_name_runs_nothing() {
+    // given
+    let library = Library::new();
+
+    // when
+    let assert = library.command().args(["photos", "musci"]).assert();
+
+    // then
+    assert
+        .code(2)
+        .stderr(contains("unknown backup musci; available: books, photos"));
+    assert!(!library.backed_up("photos"));
+}
+
+#[test]
+fn env_pair_overrides_named_backups_for_a_one_off_run() {
+    // given
+    let library = Library::new();
+    write(&library.env.source(), "one-off.txt", "x");
+
+    // when
+    let assert = library.env.command().assert();
+
+    // then
+    assert.success().stdout(contains("[books]").not());
+    assert!(library.env.target().join("one-off.txt").exists());
+    assert!(!library.backed_up("books"));
+}
+
+#[test]
+fn dry_run_covers_every_named_backup() {
+    // given
+    let library = Library::new();
+
+    // when
+    let assert = library.command().arg("-n").assert();
+
+    // then
+    let output = String::from_utf8(assert.success().get_output().stdout.clone()).unwrap();
+    assert_eq!(output.matches("dry run: would copy 1 new").count(), 2);
+    assert!(!library.backed_up("books"));
 }
