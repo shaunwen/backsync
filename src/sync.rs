@@ -197,12 +197,37 @@ fn is_out_of_space(error: &io::Error) -> bool {
     )
 }
 
+const REMOVE_DIR_ATTEMPTS: usize = 10;
+
 fn remove(target: &TargetRoot, relative: &Path) -> io::Result<()> {
     let path = target.guard(relative)?;
-    if fs::symlink_metadata(&path)?.is_dir() {
-        fs::remove_dir_all(&path)
-    } else {
-        fs::remove_file(&path)
+    let result = match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_dir() => remove_dir_tree(&path),
+        Ok(_) => fs::remove_file(&path),
+        Err(error) => Err(error),
+    };
+    match result {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+/// exFAT directory listings shift while entries are deleted (and macOS deletes
+/// each file's `._` sidecar alongside it), so a single `remove_dir_all` pass can
+/// skip entries and fail with "directory not empty". Each pass removes most of
+/// what remains, so repeating converges.
+fn remove_dir_tree(path: &Path) -> io::Result<()> {
+    let mut attempt = 1;
+    loop {
+        match fs::remove_dir_all(path) {
+            Err(error)
+                if error.kind() == io::ErrorKind::DirectoryNotEmpty
+                    && attempt < REMOVE_DIR_ATTEMPTS =>
+            {
+                attempt += 1;
+            }
+            result => return result,
+        }
     }
 }
 
@@ -504,6 +529,23 @@ mod tests {
         assert!(fx.target.join("x/old.txt").exists());
         assert_eq!(outcome.errors.len(), 1);
         assert_eq!(outcome.errors[0].path, PathBuf::from("x"));
+    }
+
+    #[test]
+    fn removing_an_entry_that_is_already_gone_succeeds() {
+        // given
+        let fx = Fixture::new();
+        let plan = Plan {
+            remove: vec!["._vanished-with-its-owner".into()],
+            ..Plan::default()
+        };
+
+        // when
+        let outcome = fx.run(&plan, true);
+
+        // then
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert_eq!(outcome.removed, 1);
     }
 
     #[test]
