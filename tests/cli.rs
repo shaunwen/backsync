@@ -521,3 +521,48 @@ fn apple_double_sidecars_next_to_backed_up_files_survive_resync() {
     assert!(env.target().join("photos/._a.jpg").exists());
     assert!(!env.target().join("photos/._gone.jpg").exists());
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn unicode_normalization_differences_do_not_cause_recopies() {
+    // given
+    let env = Env::new();
+    let composed = "S\u{f6}nke/caf\u{e9}.txt";
+    let decomposed = "So\u{308}nke/cafe\u{301}.txt";
+    write(&env.source(), composed, "same");
+    write(&env.target(), decomposed, "same");
+    let mtime =
+        FileTime::from_last_modification_time(&fs::metadata(env.source().join(composed)).unwrap());
+    filetime::set_file_mtime(env.target().join(decomposed), mtime).unwrap();
+
+    // when
+    let assert = env.sync();
+
+    // then
+    assert
+        .success()
+        .stdout(contains("0 new, 0 updated, 0 removed, 1 unchanged"));
+    assert_eq!(
+        fs::read_to_string(env.target().join(decomposed)).unwrap(),
+        "same"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn new_backups_keep_the_source_spelling_of_names() {
+    // given
+    let env = Env::new();
+    let decomposed = "cafe\u{301}.txt";
+    write(&env.source(), decomposed, "x");
+
+    // when
+    env.sync().success();
+
+    // then
+    let names: Vec<String> = fs::read_dir(env.target())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(names, vec![decomposed.to_string()]);
+}

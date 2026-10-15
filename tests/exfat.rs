@@ -72,6 +72,7 @@ fn exfat_backup_resyncs_cleanly_and_removes_deleted_folders() {
     for name in ["a", "b", "c", "d", "e"] {
         folder_with_xattr_files(&source, name);
     }
+    fs::write(source.join("e/S\u{f6}nke caf\u{e9}.txt"), "accented").unwrap();
     let sync = || {
         let mut cmd = Command::cargo_bin("backsync").unwrap();
         cmd.env("XDG_CONFIG_HOME", dir.path())
@@ -79,7 +80,7 @@ fn exfat_backup_resyncs_cleanly_and_removes_deleted_folders() {
             .env("BACKSYNC_TARGET", &target);
         cmd.assert()
     };
-    sync().success().stdout(contains("500 new"));
+    sync().success().stdout(contains("501 new"));
 
     // when
     let resync = sync();
@@ -91,7 +92,7 @@ fn exfat_backup_resyncs_cleanly_and_removes_deleted_folders() {
     // then
     resync
         .success()
-        .stdout(contains("0 new, 0 updated, 0 removed, 500 unchanged"));
+        .stdout(contains("0 new, 0 updated, 0 removed, 501 unchanged"));
     after_delete.success();
     for name in ["a", "b", "c", "d"] {
         assert!(!target.join(name).exists(), "{name} was not removed");

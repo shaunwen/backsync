@@ -10,7 +10,7 @@ use filetime::FileTime;
 use rayon::prelude::*;
 
 use crate::plan::{CopyAction, CopyReason, Plan};
-use crate::scan::Entry;
+use crate::scan::{DiskNames, Entry, disk_path};
 
 const TEMP_PREFIX: &str = ".backsync-tmp";
 
@@ -71,6 +71,12 @@ pub struct Options {
     pub jobs: usize,
 }
 
+#[derive(Default)]
+pub struct Names {
+    pub source: DiskNames,
+    pub target: DiskNames,
+}
+
 type Copier<'a> = dyn Fn(&CopyAction) -> io::Result<u64> + Sync + 'a;
 
 enum CopyResult {
@@ -83,11 +89,15 @@ pub fn execute(
     plan: &Plan,
     source_root: &Path,
     target: &TargetRoot,
+    names: &Names,
     options: &Options,
     on_event: &(dyn Fn(Event) + Sync),
 ) -> Outcome {
-    let copier = |action: &CopyAction| copy_entry(source_root, target, &action.path, &action.entry);
-    let run = || execute_with(plan, target, options.allow_delete, on_event, &copier);
+    let copier = |action: &CopyAction| {
+        let disk = disk_path(&names.source, &action.path);
+        copy_entry(source_root, target, disk, &action.entry)
+    };
+    let run = || execute_with(plan, target, names, options.allow_delete, on_event, &copier);
     match rayon::ThreadPoolBuilder::new()
         .num_threads(options.jobs.max(1))
         .build()
@@ -100,6 +110,7 @@ pub fn execute(
 fn execute_with(
     plan: &Plan,
     target: &TargetRoot,
+    names: &Names,
     allow_delete: bool,
     on_event: &(dyn Fn(Event) + Sync),
     copier: &Copier,
@@ -111,13 +122,15 @@ fn execute_with(
         let failures: Vec<(&Path, SyncError)> = plan
             .remove
             .par_iter()
-            .filter_map(|path| match remove(target, path) {
-                Ok(()) => {
-                    on_event(Event::Removed(path));
-                    None
-                }
-                Err(error) => Some((path.as_path(), failure(path, "remove", &error))),
-            })
+            .filter_map(
+                |path| match remove(target, disk_path(&names.target, path)) {
+                    Ok(()) => {
+                        on_event(Event::Removed(path));
+                        None
+                    }
+                    Err(error) => Some((path.as_path(), failure(path, "remove", &error))),
+                },
+            )
             .collect();
         outcome.removed = plan.remove.len() - failures.len();
         for (path, error) in failures {
@@ -134,7 +147,10 @@ fn execute_with(
             outcome.errors.push(error);
             continue;
         }
-        match target.guard(path).and_then(fs::create_dir_all) {
+        match target
+            .guard(disk_path(&names.source, path))
+            .and_then(fs::create_dir_all)
+        {
             Ok(()) => {
                 outcome.created_dirs += 1;
                 on_event(Event::CreatedDir(path));
@@ -317,6 +333,7 @@ mod tests {
                 plan,
                 &self.source,
                 &TargetRoot::new(self.target.clone()),
+                &Names::default(),
                 &Options {
                     allow_delete,
                     jobs: 2,
@@ -577,6 +594,7 @@ mod tests {
             execute_with(
                 &plan,
                 &TargetRoot::new(fx.target.clone()),
+                &Names::default(),
                 true,
                 &|_| {},
                 &copier,
@@ -652,6 +670,7 @@ mod tests {
             &plan,
             &fx.source,
             &TargetRoot::new(fx.target.clone()),
+            &Names::default(),
             &Options {
                 allow_delete: true,
                 jobs: 2,

@@ -26,11 +26,37 @@ pub struct ScanError {
     pub message: String,
 }
 
+/// Comparison key -> on-disk relative path, only for entries where they differ.
+pub type DiskNames = HashMap<PathBuf, PathBuf>;
+
 #[derive(Debug, Default)]
 pub struct Scan {
     pub entries: HashMap<PathBuf, Entry>,
+    pub disk_names: DiskNames,
     pub errors: Vec<ScanError>,
     pub skipped_special: Vec<PathBuf>,
+}
+
+pub fn disk_path<'a>(names: &'a DiskNames, key: &'a Path) -> &'a Path {
+    names.get(key).map_or(key, PathBuf::as_path)
+}
+
+/// macOS file systems match names regardless of Unicode normalization, but
+/// list them in different forms (exFAT and HFS+ return decomposed NFD names,
+/// APFS keeps whatever was written). Comparing NFC keys stops the same file
+/// from looking deleted on one side and new on the other.
+#[cfg(target_os = "macos")]
+pub fn name_key(relative: &Path) -> PathBuf {
+    use unicode_normalization::{UnicodeNormalization, is_nfc};
+    match relative.to_str() {
+        Some(text) if !is_nfc(text) => PathBuf::from(text.nfc().collect::<String>()),
+        _ => relative.to_path_buf(),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn name_key(relative: &Path) -> PathBuf {
+    relative.to_path_buf()
 }
 
 #[derive(Debug, Default)]
@@ -84,7 +110,11 @@ pub fn scan(root: &Path, threads: usize) -> Scan {
                     .to_path_buf();
                 match entry.client_state {
                     Probe::Found(found) => {
-                        scan.entries.insert(relative, found);
+                        let key = name_key(&relative);
+                        if key != relative {
+                            scan.disk_names.insert(key.clone(), relative);
+                        }
+                        scan.entries.insert(key, found);
                     }
                     Probe::Special => scan.skipped_special.push(relative),
                     Probe::Failed(message) => scan.errors.push(ScanError { path, message }),
@@ -167,6 +197,29 @@ mod tests {
         assert_eq!(scan.entries[Path::new("docs/deep")], Entry::Dir);
         assert!(scan.entries.contains_key(Path::new("docs/deep/b.txt")));
         assert_eq!(scan.entries[Path::new("empty")], Entry::Dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn keys_entries_by_composed_name_and_remembers_disk_name() {
+        // given
+        let root = tempfile::tempdir().unwrap();
+        write(root.path(), "cafe\u{301}/menu.txt", "x");
+
+        // when
+        let scan = scan(root.path(), 4);
+
+        // then
+        let key = Path::new("caf\u{e9}/menu.txt");
+        assert!(scan.entries.contains_key(key));
+        assert_eq!(
+            disk_path(&scan.disk_names, key),
+            Path::new("cafe\u{301}/menu.txt")
+        );
+        assert_eq!(
+            disk_path(&scan.disk_names, Path::new("plain")),
+            Path::new("plain")
+        );
     }
 
     #[test]

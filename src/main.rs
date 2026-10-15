@@ -9,8 +9,8 @@ use backsync::compare::same_content;
 use backsync::config::{self, Config};
 use backsync::plan::{self, Compare};
 use backsync::report;
-use backsync::scan::{Scan, scan};
-use backsync::sync::{self, TargetRoot};
+use backsync::scan::{Scan, disk_path, scan};
+use backsync::sync::{self, Names, TargetRoot};
 use clap::Parser;
 
 /// Mirror a source folder into a backup target folder.
@@ -90,8 +90,11 @@ fn run(cli: &Cli) -> Result<Status> {
             modify_window: config.modify_window,
         }
     };
-    let plan = plan::diff(&source.entries, &target.entries, compare, |relative| {
-        same_content(&config.source.join(relative), &config.target.join(relative))
+    let plan = plan::diff(&source.entries, &target.entries, compare, |key| {
+        same_content(
+            &config.source.join(disk_path(&source.disk_names, key)),
+            &config.target.join(disk_path(&target.disk_names, key)),
+        )
     });
     let allow_delete = source.errors.is_empty();
     let scans_clean = source.errors.is_empty() && target.errors.is_empty();
@@ -109,6 +112,10 @@ fn run(cli: &Cli) -> Result<Status> {
         &plan,
         &config.source,
         &TargetRoot::new(config.target.clone()),
+        &Names {
+            source: source.disk_names,
+            target: target.disk_names,
+        },
         &sync::Options {
             allow_delete,
             jobs: cli.jobs.map_or(config.jobs, usize::from),
