@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use indexmap::IndexMap;
 use serde::Deserialize;
 
 pub const SOURCE_ENV: &str = "BACKSYNC_SOURCE";
@@ -17,6 +18,17 @@ pub struct FileConfig {
     pub target: Option<String>,
     pub modify_window_secs: Option<u64>,
     pub jobs: Option<usize>,
+    #[serde(default)]
+    pub backup: IndexMap<String, BackupEntry>,
+}
+
+#[derive(Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupEntry {
+    pub source: String,
+    pub target: String,
+    pub modify_window_secs: Option<u64>,
+    pub jobs: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -25,6 +37,12 @@ pub struct Config {
     pub target: PathBuf,
     pub modify_window: Duration,
     pub jobs: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Backup {
+    pub name: Option<String>,
+    pub config: Config,
 }
 
 pub fn default_config_path(env: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
@@ -43,29 +61,141 @@ pub fn load_file(path: &Path, must_exist: bool) -> Result<FileConfig> {
     toml::from_str(&text).with_context(|| format!("invalid config file {}", path.display()))
 }
 
-pub fn resolve(file: FileConfig, env: impl Fn(&str) -> Option<String>) -> Result<Config> {
+pub fn resolve_backups(
+    file: FileConfig,
+    env: impl Fn(&str) -> Option<String>,
+    names: &[String],
+) -> Result<Vec<Backup>> {
     let home = non_empty(env("HOME"));
-    let pick = |env_name: &str, file_value: Option<String>, field: &str| -> Result<PathBuf> {
-        let raw = non_empty(env(env_name))
-            .or_else(|| non_empty(file_value))
-            .with_context(|| {
-                format!("{field} folder is not set: set {env_name} or `{field}` in the config file")
-            })?;
-        Ok(expand_tilde(&raw, home.as_deref()))
+    let env_source = non_empty(env(SOURCE_ENV));
+    let env_target = non_empty(env(TARGET_ENV));
+    let defaults = file_tuning(&file);
+
+    if env_source.is_some() || env_target.is_some() {
+        if !names.is_empty() {
+            bail!(
+                "backup names cannot be combined with {SOURCE_ENV} / {TARGET_ENV}; \
+                 unset them to run named backups"
+            );
+        }
+        let pair = (
+            env_source.or_else(|| non_empty(file.source)),
+            env_target.or_else(|| non_empty(file.target)),
+        );
+        return Ok(vec![single(pair, &defaults, home.as_deref())?]);
+    }
+
+    if file.backup.is_empty() {
+        if !names.is_empty() {
+            bail!("the config file has no [backup.<name>] sections to select from");
+        }
+        let pair = (non_empty(file.source), non_empty(file.target));
+        return Ok(vec![single(pair, &defaults, home.as_deref())?]);
+    }
+
+    if non_empty(file.source.clone()).is_some() || non_empty(file.target.clone()).is_some() {
+        bail!(
+            "the config file has both top-level `source` / `target` and [backup.<name>] \
+             sections; move the top-level pair into a named section"
+        );
+    }
+    if let Some(name) = file.backup.keys().find(|name| name.trim().is_empty()) {
+        bail!("backup name {name:?} is empty");
+    }
+
+    selected_names(&file.backup, names)?
+        .into_iter()
+        .map(|name| {
+            let entry = &file.backup[name];
+            let tuning = Tuning {
+                modify_window_secs: entry.modify_window_secs.or(defaults.modify_window_secs),
+                jobs: entry.jobs.or(defaults.jobs),
+            };
+            let config = build(&entry.source, &entry.target, &tuning, home.as_deref())
+                .with_context(|| format!("backup '{name}'"))?;
+            Ok(Backup {
+                name: Some(name.clone()),
+                config,
+            })
+        })
+        .collect()
+}
+
+struct Tuning {
+    modify_window_secs: Option<u64>,
+    jobs: Option<usize>,
+}
+
+fn file_tuning(file: &FileConfig) -> Tuning {
+    Tuning {
+        modify_window_secs: file.modify_window_secs,
+        jobs: file.jobs,
+    }
+}
+
+fn single(
+    (source, target): (Option<String>, Option<String>),
+    tuning: &Tuning,
+    home: Option<&str>,
+) -> Result<Backup> {
+    let missing = |env_name: &str, field: &str| {
+        format!(
+            "{field} folder is not set: set {env_name}, `{field}` in the config file, \
+             or add [backup.<name>] sections"
+        )
     };
-    let jobs = file.jobs.unwrap_or(DEFAULT_JOBS);
+    let source = source.with_context(|| missing(SOURCE_ENV, "source"))?;
+    let target = target.with_context(|| missing(TARGET_ENV, "target"))?;
+    Ok(Backup {
+        name: None,
+        config: build(&source, &target, tuning, home)?,
+    })
+}
+
+fn build(source: &str, target: &str, tuning: &Tuning, home: Option<&str>) -> Result<Config> {
+    let jobs = tuning.jobs.unwrap_or(DEFAULT_JOBS);
     if jobs == 0 {
-        bail!("`jobs` in the config file must be at least 1");
+        bail!("`jobs` must be at least 1");
     }
     Ok(Config {
-        source: pick(SOURCE_ENV, file.source, "source")?,
-        target: pick(TARGET_ENV, file.target, "target")?,
+        source: expand_tilde(source, home),
+        target: expand_tilde(target, home),
         modify_window: Duration::from_secs(
-            file.modify_window_secs
+            tuning
+                .modify_window_secs
                 .unwrap_or(DEFAULT_MODIFY_WINDOW_SECS),
         ),
         jobs,
     })
+}
+
+fn selected_names<'a>(
+    backups: &'a IndexMap<String, BackupEntry>,
+    names: &'a [String],
+) -> Result<Vec<&'a String>> {
+    if names.is_empty() {
+        return Ok(backups.keys().collect());
+    }
+    let unknown: Vec<&str> = names
+        .iter()
+        .filter(|name| !backups.contains_key(*name))
+        .map(String::as_str)
+        .collect();
+    if !unknown.is_empty() {
+        let available: Vec<&str> = backups.keys().map(String::as_str).collect();
+        bail!(
+            "unknown backup {}; available: {}",
+            unknown.join(", "),
+            available.join(", ")
+        );
+    }
+    let mut selected: Vec<&String> = Vec::new();
+    for name in names {
+        if !selected.contains(&name) {
+            selected.push(name);
+        }
+    }
+    Ok(selected)
 }
 
 pub fn validate(config: Config) -> Result<Config> {
@@ -141,9 +271,216 @@ mod tests {
         FileConfig {
             source: Some(source.into()),
             target: Some(target.into()),
-            modify_window_secs: None,
-            jobs: None,
+            ..FileConfig::default()
         }
+    }
+
+    fn resolve(file: FileConfig, env: impl Fn(&str) -> Option<String>) -> Result<Config> {
+        let mut backups = resolve_backups(file, env, &[])?;
+        assert_eq!(backups.len(), 1);
+        Ok(backups.remove(0).config)
+    }
+
+    fn parse(text: &str) -> FileConfig {
+        toml::from_str(text).unwrap()
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|n| n.to_string()).collect()
+    }
+
+    fn summary(backups: &[Backup]) -> Vec<(Option<&str>, &Path, &Path)> {
+        backups
+            .iter()
+            .map(|b| {
+                (
+                    b.name.as_deref(),
+                    b.config.source.as_path(),
+                    b.config.target.as_path(),
+                )
+            })
+            .collect()
+    }
+
+    const TWO_BACKUPS: &str = r#"
+        [backup.zeta]
+        source = "~/z"
+        target = "/Volumes/D/z"
+
+        [backup.alpha]
+        source = "/a"
+        target = "/Volumes/D/a"
+    "#;
+
+    #[test]
+    fn named_backups_all_run_in_file_order() {
+        // given
+        let file = parse(TWO_BACKUPS);
+        let env = env_of(&[("HOME", "/Users/me")]);
+
+        // when
+        let backups = resolve_backups(file, env, &[]).unwrap();
+
+        // then
+        assert_eq!(
+            summary(&backups),
+            vec![
+                (
+                    Some("zeta"),
+                    Path::new("/Users/me/z"),
+                    Path::new("/Volumes/D/z")
+                ),
+                (Some("alpha"), Path::new("/a"), Path::new("/Volumes/D/a")),
+            ]
+        );
+    }
+
+    #[test]
+    fn selected_backups_run_in_the_given_order_once_each() {
+        // given
+        let file = parse(TWO_BACKUPS);
+
+        // when
+        let backups =
+            resolve_backups(file, env_of(&[]), &names(&["alpha", "zeta", "alpha"])).unwrap();
+
+        // then
+        let order: Vec<_> = backups.iter().map(|b| b.name.as_deref()).collect();
+        assert_eq!(order, vec![Some("alpha"), Some("zeta")]);
+    }
+
+    #[test]
+    fn unknown_backup_name_lists_the_available_ones() {
+        // given
+        let file = parse(TWO_BACKUPS);
+
+        // when
+        let error = resolve_backups(file, env_of(&[]), &names(&["alpah"])).unwrap_err();
+
+        // then
+        assert_eq!(
+            error.to_string(),
+            "unknown backup alpah; available: zeta, alpha"
+        );
+    }
+
+    #[test]
+    fn per_backup_settings_override_top_level_defaults() {
+        // given
+        let file = parse(
+            r#"
+            jobs = 8
+            modify_window_secs = 5
+
+            [backup.fast]
+            source = "/a"
+            target = "/b"
+
+            [backup.slow]
+            source = "/c"
+            target = "/d"
+            jobs = 1
+            modify_window_secs = 0
+        "#,
+        );
+
+        // when
+        let backups = resolve_backups(file, env_of(&[]), &[]).unwrap();
+
+        // then
+        let settings: Vec<_> = backups
+            .iter()
+            .map(|b| (b.config.jobs, b.config.modify_window))
+            .collect();
+        assert_eq!(
+            settings,
+            vec![(8, Duration::from_secs(5)), (1, Duration::ZERO)]
+        );
+    }
+
+    #[test]
+    fn env_pair_runs_alone_and_ignores_named_backups() {
+        // given
+        let file = parse(TWO_BACKUPS);
+        let env = env_of(&[(SOURCE_ENV, "/env/src"), (TARGET_ENV, "/env/dst")]);
+
+        // when
+        let backups = resolve_backups(file, env, &[]).unwrap();
+
+        // then
+        assert_eq!(
+            summary(&backups),
+            vec![(None, Path::new("/env/src"), Path::new("/env/dst"))]
+        );
+    }
+
+    #[test]
+    fn backup_names_cannot_be_combined_with_env_pair() {
+        // given
+        let file = parse(TWO_BACKUPS);
+        let env = env_of(&[(SOURCE_ENV, "/env/src")]);
+
+        // when
+        let error = resolve_backups(file, env, &names(&["alpha"])).unwrap_err();
+
+        // then
+        assert!(error.to_string().contains("cannot be combined"));
+    }
+
+    #[test]
+    fn backup_names_need_named_sections() {
+        // given
+        let file = file_config("/a", "/b");
+
+        // when
+        let error = resolve_backups(file, env_of(&[]), &names(&["books"])).unwrap_err();
+
+        // then
+        assert!(error.to_string().contains("no [backup.<name>] sections"));
+    }
+
+    #[test]
+    fn top_level_pair_and_named_sections_together_are_ambiguous() {
+        // given
+        let file = parse(
+            r#"
+            source = "/a"
+            target = "/b"
+
+            [backup.books]
+            source = "/c"
+            target = "/d"
+        "#,
+        );
+
+        // when
+        let error = resolve_backups(file, env_of(&[]), &[]).unwrap_err();
+
+        // then
+        assert!(error.to_string().contains("both top-level"));
+    }
+
+    #[test]
+    fn invalid_backup_sections_are_rejected() {
+        // given
+        let missing_target = "[backup.books]\nsource = \"/a\"\n";
+        let unknown_key = "[backup.books]\nsource = \"/a\"\ntarget = \"/b\"\nexclude = []\n";
+        let empty_name = "[backup.\"\"]\nsource = \"/a\"\ntarget = \"/b\"\n";
+        let zero_jobs = "[backup.books]\nsource = \"/a\"\ntarget = \"/b\"\njobs = 0\n";
+
+        // when
+        let parse_errors =
+            [missing_target, unknown_key].map(|t| toml::from_str::<FileConfig>(t).is_err());
+        let empty = resolve_backups(parse(empty_name), env_of(&[]), &[]);
+        let zero = resolve_backups(parse(zero_jobs), env_of(&[]), &[]);
+
+        // then
+        assert_eq!(parse_errors, [true, true]);
+        assert!(empty.is_err());
+        assert_eq!(
+            format!("{:#}", zero.unwrap_err()),
+            "backup 'books': `jobs` must be at least 1"
+        );
     }
 
     #[test]

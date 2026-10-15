@@ -6,21 +6,26 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use backsync::compare::same_content;
-use backsync::config::{self, Config};
+use backsync::config::{self, Backup, Config};
 use backsync::plan::{self, Compare};
 use backsync::report;
 use backsync::scan::{Scan, disk_path, scan};
 use backsync::sync::{self, Names, TargetRoot};
 use clap::Parser;
 
-/// Mirror a source folder into a backup target folder.
+/// Mirror source folders into backup target folders.
 ///
 /// Copies new and changed files, removes files deleted from the source,
-/// and never modifies the source. Source and target come from
-/// BACKSYNC_SOURCE / BACKSYNC_TARGET or the config file (env wins).
+/// and never modifies the source. Backups come from [backup.<name>] sections
+/// in the config file, or a single pair from `source` / `target` there or
+/// BACKSYNC_SOURCE / BACKSYNC_TARGET (env wins).
 #[derive(Parser)]
 #[command(version)]
 struct Cli {
+    /// Backups to run, by their [backup.<name>] in the config file [default: all]
+    #[arg(value_name = "NAME")]
+    names: Vec<String>,
+
     /// Config file [default: $XDG_CONFIG_HOME or ~/.config, then backsync/config.toml]
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
@@ -46,25 +51,81 @@ struct Cli {
     jobs: Option<u16>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Status {
     Clean,
     Partial,
+    Refused,
 }
 
-fn main() -> ExitCode {
-    let cli = Cli::parse();
-    match run(&cli) {
-        Ok(Status::Clean) => ExitCode::SUCCESS,
-        Ok(Status::Partial) => ExitCode::from(1),
-        Err(error) => {
-            eprintln!("backsync: {error:#}");
-            ExitCode::from(2)
+impl Status {
+    fn label(self) -> &'static str {
+        match self {
+            Status::Clean => "ok",
+            Status::Partial => "finished with errors",
+            Status::Refused => "not run",
+        }
+    }
+
+    fn exit_code(self) -> ExitCode {
+        match self {
+            Status::Clean => ExitCode::SUCCESS,
+            Status::Partial => ExitCode::from(1),
+            Status::Refused => ExitCode::from(2),
         }
     }
 }
 
-fn run(cli: &Cli) -> Result<Status> {
-    let config = load_config(cli)?;
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    let backups = match load_backups(&cli) {
+        Ok(backups) => backups,
+        Err(error) => {
+            eprintln!("backsync: {error:#}");
+            return Status::Refused.exit_code();
+        }
+    };
+
+    let mut results = Vec::with_capacity(backups.len());
+    for (index, backup) in backups.iter().enumerate() {
+        if let Some(name) = &backup.name {
+            if index > 0 {
+                println!();
+            }
+            println!(
+                "[{name}] {} -> {}",
+                backup.config.source.display(),
+                backup.config.target.display()
+            );
+        }
+        let status = run_backup(&cli, &backup.config).unwrap_or_else(|error| {
+            let tag = backup
+                .name
+                .as_ref()
+                .map_or(String::new(), |name| format!("[{name}] "));
+            eprintln!("backsync: {tag}{error:#}");
+            Status::Refused
+        });
+        results.push((backup.name.as_deref(), status));
+    }
+
+    if results.len() > 1 {
+        let tally: Vec<String> = results
+            .iter()
+            .map(|(name, status)| format!("{} {}", name.unwrap_or("backup"), status.label()))
+            .collect();
+        println!("\n{}", tally.join(", "));
+    }
+    results
+        .iter()
+        .map(|(_, status)| *status)
+        .max()
+        .unwrap_or(Status::Clean)
+        .exit_code()
+}
+
+fn run_backup(cli: &Cli, config: &Config) -> Result<Status> {
+    let config = config::validate(config.clone()).context("invalid source or target")?;
     let started = Instant::now();
 
     let threads = thread::available_parallelism().map_or(4, |n| n.get());
@@ -149,7 +210,7 @@ fn status(clean: bool) -> Status {
     }
 }
 
-fn load_config(cli: &Cli) -> Result<Config> {
+fn load_backups(cli: &Cli) -> Result<Vec<Backup>> {
     let lookup = |key: &str| env::var(key).ok();
     let file = match &cli.config {
         Some(path) => config::load_file(path, true)?,
@@ -158,7 +219,7 @@ fn load_config(cli: &Cli) -> Result<Config> {
             None => config::FileConfig::default(),
         },
     };
-    config::validate(config::resolve(file, lookup)?).context("invalid source or target")
+    config::resolve_backups(file, lookup, &cli.names)
 }
 
 fn warn_scan_problems(side: &str, scan: &Scan) {
