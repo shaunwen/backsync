@@ -709,3 +709,19 @@ fn dry_run_covers_every_named_backup() {
     assert_eq!(output.matches("dry run: would copy 1 new").count(), 2);
     assert!(!library.backed_up("books"));
 }
+
+#[test]
+fn backups_named_on_the_command_line_run_in_that_order() {
+    // given
+    let library = Library::new();
+
+    // when
+    let assert = library.command().args(["photos", "books"]).assert();
+
+    // then
+    let output = String::from_utf8(assert.success().get_output().stdout.clone()).unwrap();
+    let photos = output.find("[photos] ").unwrap();
+    let books = output.find("[books] ").unwrap();
+    assert!(photos < books, "photos must run before books:\n{output}");
+    assert!(output.ends_with("photos ok, books ok\n"));
+}
