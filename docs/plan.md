@@ -223,3 +223,69 @@ Testing against real disk images (an APFS volume and an exFAT volume created wit
 | Hashing both files with blake3 reads both files fully | chunked comparison stops at the first difference and needs no dependency |
 
 Results on the final build: a no-op resync of 50k files takes about 0.1 s (rsync: 2.8 s); a first full copy to a separate APFS volume takes 8.1 s (rsync: 17.0 s).
+
+## Feature: named backups
+
+Back up several source/target pairs from one config file and run all of them or a chosen few.
+
+```toml
+jobs = 4                    # defaults for every backup (optional)
+modify_window_secs = 2
+
+[backup.books]
+source = "~/Documents/Books"
+target = "/Volumes/myDrive/Books"
+
+[backup.personal]
+source = "~/Documents/personal"
+target = "/Volumes/myDrive/personal"
+jobs = 2                    # per-backup override (optional)
+```
+
+```bash
+backsync                  # every backup, in file order
+backsync personal         # only [backup.personal]
+backsync books personal   # these two, in the order given
+```
+
+### Rules
+
+| Situation | Behaviour |
+|-----------|-----------|
+| `BACKSYNC_SOURCE` or `BACKSYNC_TARGET` is set | a single one-off pair: env fields override top-level `source` / `target` as before; named backups are ignored. Passing names as well is an error |
+| config has `[backup.<name>]` sections | no names: all of them in file order; names: only those, unknown names are an error that lists the available ones |
+| config has top-level `source` / `target` only | unchanged single-pair behaviour; passing names is an error |
+| config has both top-level `source` / `target` and named sections | error: ambiguous |
+| `jobs`, `modify_window_secs` | per backup, else top level, else built-in default |
+| renamed files | no rename detection: the new name is copied and the old name is removed, as for any other new and deleted file |
+
+### Running several backups
+
+```plantuml
+@startuml
+start
+:parse config and CLI names;
+if (config or names invalid?) then (yes)
+  :exit 2, nothing runs;
+  stop
+endif
+while (next selected backup?)
+  :print "[name] source -> target";
+  :validate folders, scan, plan, sync;
+  note right
+    a failure here (drive not mounted,
+    safety refusal, per-file errors)
+    is reported and the next backup
+    still runs
+  end note
+endwhile
+:exit with the worst status\n(2 refused > 1 partial > 0 clean);
+stop
+@enduml
+```
+
+### Implementation
+
+- `config`: `FileConfig` gains `backup: IndexMap<String, BackupEntry>`; `toml` gets `preserve_order` so sections keep file order. `resolve` becomes `resolve_backups(file, env, names) -> Vec<Backup>` where `Backup { name: Option<String>, config: Config }`. Per-backup folder validation stays at run time so one unmounted drive does not block the others.
+- `main`: positional `NAMES...`; loops over backups, runs each with the existing pipeline, aggregates the exit status, prints a one-line tally when more than one ran.
+- Tests: unit tests for every rule above; end-to-end tests for all / one / several backups, unknown name, one failing backup not blocking the next, env override, per-backup `jobs`.
