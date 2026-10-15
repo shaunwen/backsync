@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::mem::discriminant;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -64,10 +66,9 @@ pub fn diff(
         remove: topmost(
             target
                 .iter()
-                .filter(|(path, entry)| {
-                    source
-                        .get(*path)
-                        .is_none_or(|src| discriminant(src) != discriminant(*entry))
+                .filter(|(path, entry)| match source.get(*path) {
+                    Some(src) => discriminant(src) != discriminant(*entry),
+                    None => !is_sidecar_of_mirrored_entry(path, source),
                 })
                 .map(|(path, _)| path.clone())
                 .collect(),
@@ -145,6 +146,22 @@ fn judge(
 fn within(a: SystemTime, b: SystemTime, window: Duration) -> bool {
     let gap = a.duration_since(b).unwrap_or_else(|e| e.duration());
     gap <= window
+}
+
+/// On file systems without native extended attributes (exFAT, FAT32), macOS
+/// stores a file's attributes in a `._<name>` AppleDouble sidecar. Copying
+/// creates it, and deleting or renaming the owner removes it, so it must not be
+/// treated as an extraneous file while its owner is part of the mirror.
+fn is_sidecar_of_mirrored_entry(path: &Path, source: &Entries) -> bool {
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    match name.as_bytes().strip_prefix(b"._") {
+        Some(owner) if !owner.is_empty() => {
+            source.contains_key(&path.with_file_name(OsStr::from_bytes(owner)))
+        }
+        _ => false,
+    }
 }
 
 fn topmost(candidates: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -364,5 +381,38 @@ mod tests {
         // then
         assert!(plan.remove.is_empty());
         assert_eq!(copied(&plan), vec![("l".into(), CopyReason::Changed)]);
+    }
+
+    #[test]
+    fn apple_double_sidecars_of_mirrored_files_are_kept() {
+        // given
+        let source = entries(&[("d", Entry::Dir), ("d/photo.jpg", file(1, 1))]);
+        let target = entries(&[
+            ("d", Entry::Dir),
+            ("d/photo.jpg", file(1, 1)),
+            ("d/._photo.jpg", file(4096, 1)),
+            ("._d", file(4096, 1)),
+            ("d/._deleted.jpg", file(4096, 1)),
+            ("._", file(1, 1)),
+        ]);
+
+        // when
+        let plan = diff(&source, &target, WINDOW, never_called);
+
+        // then
+        assert_eq!(plan.remove, paths(&["._", "d/._deleted.jpg"]));
+    }
+
+    #[test]
+    fn apple_double_files_that_exist_in_source_are_mirrored_normally() {
+        // given
+        let source = entries(&[("a", file(1, 1)), ("._a", file(2, 100))]);
+        let target = entries(&[("a", file(1, 1)), ("._a", file(9, 1))]);
+
+        // when
+        let plan = diff(&source, &target, WINDOW, never_called);
+
+        // then
+        assert_eq!(copied(&plan), vec![("._a".into(), CopyReason::Changed)]);
     }
 }

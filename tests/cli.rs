@@ -503,3 +503,21 @@ fn jobs_flag_controls_parallel_copies() {
     zero.code(2);
     assert_eq!(snapshot(&env.target()), snapshot(&env.source()));
 }
+
+#[test]
+fn apple_double_sidecars_next_to_backed_up_files_survive_resync() {
+    // given
+    let env = Env::new();
+    write(&env.source(), "photos/a.jpg", "jpeg");
+    env.sync().success();
+    write(&env.target(), "photos/._a.jpg", "xattrs");
+    write(&env.target(), "photos/._gone.jpg", "orphan");
+
+    // when
+    let assert = env.sync();
+
+    // then
+    assert.success().stdout(contains("1 removed"));
+    assert!(env.target().join("photos/._a.jpg").exists());
+    assert!(!env.target().join("photos/._gone.jpg").exists());
+}
