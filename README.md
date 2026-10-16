@@ -1,6 +1,6 @@
 # backsync
 
-Mirror folders to backup folders, for example on a portable drive. New and changed files are copied, files deleted from the source are deleted from the backup, and unchanged files are left alone. The source is never modified.
+Mirror folders to backup folders, for example on a portable drive. New and changed files are copied, files deleted from the source are deleted from the backup (or kept, if you prefer), and unchanged files are left alone. The source is never modified.
 
 ```text
 $ backsync
@@ -22,6 +22,7 @@ Define one named section per backup in `~/.config/backsync/config.toml` (or `$XD
 # optional defaults for every backup
 modify_window_secs = 2   # mtime difference still treated as unchanged
 jobs = 4                 # parallel copies; use 1-2 for spinning disks
+mirror_deletions = true  # delete from the backup what was deleted from the source
 
 [backup.books]
 source = "~/Documents/Books"
@@ -31,6 +32,11 @@ target = "/Volumes/myDrive/Books"
 source = "~/Documents/personal"
 target = "/Volumes/myDrive/personal"
 jobs = 2                 # per-backup override
+
+[backup.archive]
+source = "~/Pictures/Camera"
+target = "/Volumes/myDrive/Camera"
+mirror_deletions = false # keep everything ever backed up
 ```
 
 For a single backup you can skip the sections and write `source` and `target` at the top level instead (not both styles in one file).
@@ -69,13 +75,14 @@ Each named backup prints a `[name] source -> target` header and its own summary.
 - Files are written to a temporary name and renamed into place, so an interrupted run never leaves a half-written file under the real name. Leftover temp files are removed on the next run.
 - Symlinks are copied as links, never followed. Sockets and other special files are skipped with a warning.
 - Renames are not detected: a renamed file is copied under its new name and the old name is removed from the backup.
+- With `mirror_deletions = false`, files and folders deleted from the source stay in the backup and the summary counts them as kept. Changed files are still overwritten, and an entry that changed type in the source (for example a folder replaced by a file of the same name) is still replaced.
 
 ## Safety
 
 - The source is only read. Every write and delete is checked to be inside the target folder.
 - Source and target must exist and must not be the same folder or inside each other.
 - The target folder is never created. If the drive is not mounted, the run stops instead of filling the internal disk.
-- An empty source with a non-empty backup is refused (it usually means the source drive is missing). Pass `--allow-empty-source` if you really want to empty the backup.
+- An empty source with a non-empty backup is refused (it usually means the source drive is missing). Pass `--allow-empty-source` if you really want to empty the backup. With `mirror_deletions = false` nothing would be removed, so this check does not apply.
 - If any part of the source cannot be read, nothing is removed from the backup in that run.
 - macOS volume metadata at the target root (`.Spotlight-V100`, `.Trashes`, `.fseventsd`, ...) is left alone.
 

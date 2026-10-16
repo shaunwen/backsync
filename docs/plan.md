@@ -77,7 +77,7 @@ end note
 |--------|----------------|
 | `config` | Read the TOML file, overlay env, expand `~`, validate paths, enforce safety rules |
 | `scan` | Walk a root in parallel and return `relative path -> Entry` (file with size + mtime, dir, symlink with link text) plus scan errors |
-| `plan` | Pure diff of two scans into `Plan { remove, mkdir, copy, unchanged }`. No IO except the optional content comparator |
+| `plan` | Pure diff of two scans into `Plan { remove, replace, mkdir, copy, unchanged }`. No IO except the optional content comparator |
 | `sync` | Execute a plan in parallel, collect per-path errors |
 | `report` | Count and format the summary, verbose and dry-run lines |
 
@@ -137,7 +137,8 @@ A file is copied to `.backsync-tmp.<pid>.<n>` in the destination directory (shor
 
 ### Deletion and type changes
 
-- Target entries that are missing from the source are deleted.
+- Target entries that are missing from the source are deleted, unless `mirror_deletions = false` for that backup, in which case they are kept and counted.
+- Entries that changed type and leftover temp files are removed even with `mirror_deletions = false`: the first are updates of a path that still exists in the source, the second were never part of the backup.
 - If an entry changed type (file <-> dir <-> symlink), the target entry is removed and recreated.
 - Only the topmost extraneous directory is removed (`remove_dir_all`); its children are not deleted one by one.
 - Deletions run before copies, which frees space on a full drive and clears type conflicts.
