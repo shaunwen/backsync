@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use crate::plan::{CopyReason, Plan};
+use crate::plan::{CopyReason, Plan, Removals};
 use crate::sync::{Event, Outcome};
 
 pub fn event_line(event: Event) -> String {
@@ -13,32 +13,35 @@ pub fn event_line(event: Event) -> String {
     }
 }
 
-pub fn plan_lines(plan: &Plan, allow_delete: bool) -> Vec<String> {
-    let removals = plan
-        .remove
-        .iter()
-        .filter(|_| allow_delete)
+pub fn plan_lines(plan: &Plan, removals: Removals) -> Vec<String> {
+    let removed = plan
+        .removals(removals)
+        .into_iter()
         .map(|p| event_line(Event::Removed(p)));
     let dirs = plan.mkdir.iter().map(|p| event_line(Event::CreatedDir(p)));
     let copies = plan
         .copy
         .iter()
         .map(|c| event_line(Event::Copied(&c.path, c.reason)));
-    removals.chain(dirs).chain(copies).collect()
+    removed.chain(dirs).chain(copies).collect()
 }
 
-pub fn dry_run_summary(plan: &Plan, allow_delete: bool) -> String {
+pub fn dry_run_summary(plan: &Plan, removals: Removals) -> String {
     let new = plan
         .copy
         .iter()
         .filter(|c| c.reason == CopyReason::New)
         .count();
-    let removed = if allow_delete { plan.remove.len() } else { 0 };
-    format!(
-        "dry run: would copy {new} new, update {}, remove {removed}; {} unchanged",
+    let mut text = format!(
+        "dry run: would copy {new} new, update {}, remove {}; {} unchanged",
         plan.copy.len() - new,
+        plan.removals(removals).len(),
         plan.unchanged,
-    )
+    );
+    if removals == Removals::KeepDeleted && !plan.remove.is_empty() {
+        text.push_str(&kept_note(plan.remove.len()));
+    }
+    text
 }
 
 pub fn summary(outcome: &Outcome, unchanged: usize, elapsed: Duration) -> String {
@@ -51,6 +54,9 @@ pub fn summary(outcome: &Outcome, unchanged: usize, elapsed: Duration) -> String
         human_bytes(outcome.bytes),
         elapsed.as_secs_f64(),
     );
+    if outcome.kept > 0 {
+        text.push_str(&kept_note(outcome.kept));
+    }
     if outcome.removals_skipped > 0 {
         text.push_str(&format!(
             "; {} removals skipped because the source could not be fully read",
@@ -84,6 +90,10 @@ pub fn human_bytes(bytes: u64) -> String {
     }
 }
 
+fn kept_note(count: usize) -> String {
+    format!("; {count} deleted from the source kept in the backup")
+}
+
 fn line(verb: &str, path: &Path) -> String {
     format!("{verb:<7}{}", path.display())
 }
@@ -108,6 +118,7 @@ mod tests {
         };
         Plan {
             remove: vec![PathBuf::from("old.txt")],
+            replace: vec![PathBuf::from("was_dir")],
             mkdir: vec![PathBuf::from("docs")],
             copy: vec![
                 action("docs/a.txt", CopyReason::New),
@@ -123,13 +134,14 @@ mod tests {
         let plan = sample_plan();
 
         // when
-        let lines = plan_lines(&plan, true);
+        let lines = plan_lines(&plan, Removals::All);
 
         // then
         assert_eq!(
             lines,
             vec![
                 "remove old.txt",
+                "remove was_dir",
                 "mkdir  docs",
                 "new    docs/a.txt",
                 "update b.txt"
@@ -143,7 +155,7 @@ mod tests {
         let plan = sample_plan();
 
         // when
-        let lines = plan_lines(&plan, false);
+        let lines = plan_lines(&plan, Removals::None);
 
         // then
         assert!(!lines.iter().any(|l| l.starts_with("remove")));
@@ -155,12 +167,31 @@ mod tests {
         let plan = sample_plan();
 
         // when
-        let text = dry_run_summary(&plan, true);
+        let text = dry_run_summary(&plan, Removals::All);
 
         // then
         assert_eq!(
             text,
-            "dry run: would copy 1 new, update 1, remove 1; 4 unchanged"
+            "dry run: would copy 1 new, update 1, remove 2; 4 unchanged"
+        );
+    }
+
+    #[test]
+    fn dry_run_keeping_deleted_files_lists_only_replacements() {
+        // given
+        let plan = sample_plan();
+
+        // when
+        let lines = plan_lines(&plan, Removals::KeepDeleted);
+        let text = dry_run_summary(&plan, Removals::KeepDeleted);
+
+        // then
+        assert_eq!(lines[0], "remove was_dir");
+        assert!(!lines.iter().any(|l| l.contains("old.txt")));
+        assert_eq!(
+            text,
+            "dry run: would copy 1 new, update 1, remove 1; 4 unchanged; \
+             1 deleted from the source kept in the backup"
         );
     }
 
@@ -171,6 +202,7 @@ mod tests {
             copied_new: 2,
             updated: 1,
             removals_skipped: 3,
+            kept: 4,
             not_attempted: 5,
             bytes: 2048,
             errors: vec![crate::sync::SyncError {
@@ -188,6 +220,7 @@ mod tests {
         assert_eq!(
             text,
             "2 new, 1 updated, 0 removed, 10 unchanged; 2.0 KiB copied in 1.50s; \
+             4 deleted from the source kept in the backup; \
              3 removals skipped because the source could not be fully read; \
              5 copies not attempted because the target is full; 1 errors"
         );

@@ -9,10 +9,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use filetime::FileTime;
 use rayon::prelude::*;
 
-use crate::plan::{CopyAction, CopyReason, Plan};
+use crate::plan::{CopyAction, CopyReason, Plan, Removals, TEMP_PREFIX};
 use crate::scan::{DiskNames, Entry, disk_path};
-
-const TEMP_PREFIX: &str = ".backsync-tmp";
 
 pub struct TargetRoot {
     root: PathBuf,
@@ -58,6 +56,7 @@ pub struct SyncError {
 pub struct Outcome {
     pub removed: usize,
     pub removals_skipped: usize,
+    pub kept: usize,
     pub not_attempted: usize,
     pub created_dirs: usize,
     pub copied_new: usize,
@@ -67,7 +66,7 @@ pub struct Outcome {
 }
 
 pub struct Options {
-    pub allow_delete: bool,
+    pub removals: Removals,
     pub jobs: usize,
 }
 
@@ -97,7 +96,7 @@ pub fn execute(
         let disk = disk_path(&names.source, &action.path);
         copy_entry(source_root, target, disk, &action.entry)
     };
-    let run = || execute_with(plan, target, names, options.allow_delete, on_event, &copier);
+    let run = || execute_with(plan, target, names, options.removals, on_event, &copier);
     match rayon::ThreadPoolBuilder::new()
         .num_threads(options.jobs.max(1))
         .build()
@@ -111,35 +110,38 @@ fn execute_with(
     plan: &Plan,
     target: &TargetRoot,
     names: &Names,
-    allow_delete: bool,
+    removals: Removals,
     on_event: &(dyn Fn(Event) + Sync),
     copier: &Copier,
 ) -> Outcome {
     let mut outcome = Outcome::default();
     let mut blocked: HashSet<&Path> = HashSet::new();
 
-    if allow_delete {
-        let failures: Vec<(&Path, SyncError)> = plan
-            .remove
-            .par_iter()
-            .filter_map(
-                |path| match remove(target, disk_path(&names.target, path)) {
-                    Ok(()) => {
-                        on_event(Event::Removed(path));
-                        None
-                    }
-                    Err(error) => Some((path.as_path(), failure(path, "remove", &error))),
-                },
-            )
-            .collect();
-        outcome.removed = plan.remove.len() - failures.len();
-        for (path, error) in failures {
-            blocked.insert(path);
-            outcome.errors.push(error);
+    let to_remove = plan.removals(removals);
+    let failures: Vec<(&Path, SyncError)> = to_remove
+        .par_iter()
+        .filter_map(
+            |&path| match remove(target, disk_path(&names.target, path)) {
+                Ok(()) => {
+                    on_event(Event::Removed(path));
+                    None
+                }
+                Err(error) => Some((path, failure(path, "remove", &error))),
+            },
+        )
+        .collect();
+    outcome.removed = to_remove.len() - failures.len();
+    for (path, error) in failures {
+        blocked.insert(path);
+        outcome.errors.push(error);
+    }
+    match removals {
+        Removals::All => {}
+        Removals::KeepDeleted => outcome.kept = plan.remove.len(),
+        Removals::None => {
+            outcome.removals_skipped = plan.remove.len() + plan.replace.len();
+            blocked.extend(plan.replace.iter().map(PathBuf::as_path));
         }
-    } else {
-        outcome.removals_skipped = plan.remove.len();
-        blocked.extend(plan.remove.iter().map(PathBuf::as_path));
     }
 
     for path in &plan.mkdir {
@@ -328,16 +330,13 @@ mod tests {
             }
         }
 
-        fn run(&self, plan: &Plan, allow_delete: bool) -> Outcome {
+        fn run(&self, plan: &Plan, removals: Removals) -> Outcome {
             execute(
                 plan,
                 &self.source,
                 &TargetRoot::new(self.target.clone()),
                 &Names::default(),
-                &Options {
-                    allow_delete,
-                    jobs: 2,
-                },
+                &Options { removals, jobs: 2 },
                 &|_| {},
             )
         }
@@ -414,7 +413,7 @@ mod tests {
         };
 
         // when
-        let outcome = fx.run(&plan, true);
+        let outcome = fx.run(&plan, Removals::All);
 
         // then
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
@@ -442,7 +441,7 @@ mod tests {
         };
 
         // when
-        let outcome = fx.run(&plan, true);
+        let outcome = fx.run(&plan, Removals::All);
 
         // then
         assert_eq!(outcome.updated, 1);
@@ -465,7 +464,7 @@ mod tests {
         };
 
         // when
-        let outcome = fx.run(&plan, true);
+        let outcome = fx.run(&plan, Removals::All);
 
         // then
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
@@ -488,7 +487,7 @@ mod tests {
         };
 
         // when
-        let outcome = fx.run(&plan, true);
+        let outcome = fx.run(&plan, Removals::All);
 
         // then
         assert!(outcome.errors.is_empty());
@@ -513,7 +512,7 @@ mod tests {
         };
 
         // when
-        let outcome = fx.run(&plan, true);
+        let outcome = fx.run(&plan, Removals::All);
 
         // then
         assert_eq!(outcome.removed, 3);
@@ -525,6 +524,35 @@ mod tests {
     }
 
     #[test]
+    fn keeping_deleted_files_still_replaces_type_changes_and_temp_files() {
+        // given
+        let fx = Fixture::new();
+        write(&fx.source, "x", "file now");
+        write(&fx.target, "x/old.txt", "was a dir");
+        write(&fx.target, "extra.txt", "deleted from source");
+        write(&fx.target, ".backsync-tmp.1.0", "half written");
+        let plan = Plan {
+            remove: vec!["extra.txt".into()],
+            replace: vec![".backsync-tmp.1.0".into(), "x".into()],
+            copy: vec![file_action("x", CopyReason::Changed)],
+            ..Plan::default()
+        };
+
+        // when
+        let outcome = fx.run(&plan, Removals::KeepDeleted);
+
+        // then
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert_eq!((outcome.removed, outcome.kept), (2, 1));
+        assert_eq!(
+            fs::read_to_string(fx.target.join("extra.txt")).unwrap(),
+            "deleted from source"
+        );
+        assert_eq!(fs::read_to_string(fx.target.join("x")).unwrap(), "file now");
+        assert!(no_temp_files(&fx.target));
+    }
+
+    #[test]
     fn deletion_disabled_keeps_target_and_blocks_conflicting_writes() {
         // given
         let fx = Fixture::new();
@@ -532,13 +560,14 @@ mod tests {
         write(&fx.target, "x/old.txt", "was a dir");
         write(&fx.target, "extra.txt", "x");
         let plan = Plan {
-            remove: vec!["extra.txt".into(), "x".into()],
+            remove: vec!["extra.txt".into()],
+            replace: vec!["x".into()],
             copy: vec![file_action("x", CopyReason::Changed)],
             ..Plan::default()
         };
 
         // when
-        let outcome = fx.run(&plan, false);
+        let outcome = fx.run(&plan, Removals::None);
 
         // then
         assert_eq!(outcome.removals_skipped, 2);
@@ -558,7 +587,7 @@ mod tests {
         };
 
         // when
-        let outcome = fx.run(&plan, true);
+        let outcome = fx.run(&plan, Removals::All);
 
         // then
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
@@ -595,7 +624,7 @@ mod tests {
                 &plan,
                 &TargetRoot::new(fx.target.clone()),
                 &Names::default(),
-                true,
+                Removals::All,
                 &|_| {},
                 &copier,
             )
@@ -622,7 +651,7 @@ mod tests {
         };
 
         // when
-        let outcome = fx.run(&plan, true);
+        let outcome = fx.run(&plan, Removals::All);
 
         // then
         assert_eq!(outcome.copied_new, 1);
@@ -643,7 +672,7 @@ mod tests {
         };
 
         // when
-        let outcome = fx.run(&plan, true);
+        let outcome = fx.run(&plan, Removals::All);
         fs::set_permissions(&fx.source, fs::Permissions::from_mode(0o755)).unwrap();
 
         // then
@@ -672,7 +701,7 @@ mod tests {
             &TargetRoot::new(fx.target.clone()),
             &Names::default(),
             &Options {
-                allow_delete: true,
+                removals: Removals::All,
                 jobs: 2,
             },
             &|event| events.lock().unwrap().push(format!("{event:?}")),

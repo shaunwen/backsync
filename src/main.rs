@@ -7,18 +7,21 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use backsync::compare::same_content;
 use backsync::config::{self, Backup, Config};
-use backsync::plan::{self, Compare};
+use backsync::plan::{self, Compare, Removals};
 use backsync::report;
 use backsync::scan::{Scan, disk_path, scan};
 use backsync::sync::{self, Names, TargetRoot};
 use clap::Parser;
 
-/// Mirror source folders into backup target folders.
-///
-/// Copies new and changed files, removes files deleted from the source,
-/// and never modifies the source. Backups come from [backup.<name>] sections
-/// in the config file, or a single pair from `source` / `target` there or
-/// BACKSYNC_SOURCE / BACKSYNC_TARGET (env wins).
+/**
+Mirror source folders into backup target folders.
+
+Copies new and changed files, removes files deleted from the source
+(unless `mirror_deletions = false`), and never modifies the source.
+Backups come from [backup.<name>] sections in the config file, or a single
+pair from `source` / `target` there or BACKSYNC_SOURCE / BACKSYNC_TARGET
+(env wins).
+*/
 #[derive(Parser)]
 #[command(version)]
 struct Cli {
@@ -134,7 +137,11 @@ fn run_backup(cli: &Cli, config: &Config) -> Result<Status> {
         let source = scan(&config.source, threads);
         (source, target.join().expect("target scan thread panicked"))
     });
-    if source.entries.is_empty() && !target.entries.is_empty() && !cli.allow_empty_source {
+    if config.mirror_deletions
+        && source.entries.is_empty()
+        && !target.entries.is_empty()
+        && !cli.allow_empty_source
+    {
         bail!(
             "source {} is empty but the backup is not; refusing to empty the backup \
              (is the source drive mounted? use --allow-empty-source if this is intended)",
@@ -157,14 +164,20 @@ fn run_backup(cli: &Cli, config: &Config) -> Result<Status> {
             &config.target.join(disk_path(&target.disk_names, key)),
         )
     });
-    let allow_delete = source.errors.is_empty();
+    let removals = if !source.errors.is_empty() {
+        Removals::None
+    } else if config.mirror_deletions {
+        Removals::All
+    } else {
+        Removals::KeepDeleted
+    };
     let scans_clean = source.errors.is_empty() && target.errors.is_empty();
 
     if cli.dry_run {
-        for line in report::plan_lines(&plan, allow_delete) {
+        for line in report::plan_lines(&plan, removals) {
             println!("{line}");
         }
-        println!("{}", report::dry_run_summary(&plan, allow_delete));
+        println!("{}", report::dry_run_summary(&plan, removals));
         return Ok(status(scans_clean));
     }
 
@@ -178,7 +191,7 @@ fn run_backup(cli: &Cli, config: &Config) -> Result<Status> {
             target: target.disk_names,
         },
         &sync::Options {
-            allow_delete,
+            removals,
             jobs: cli.jobs.map_or(config.jobs, usize::from),
         },
         &|event| {

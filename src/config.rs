@@ -18,6 +18,7 @@ pub struct FileConfig {
     pub target: Option<String>,
     pub modify_window_secs: Option<u64>,
     pub jobs: Option<usize>,
+    pub mirror_deletions: Option<bool>,
     #[serde(default)]
     pub backup: IndexMap<String, BackupEntry>,
 }
@@ -29,6 +30,7 @@ pub struct BackupEntry {
     pub target: String,
     pub modify_window_secs: Option<u64>,
     pub jobs: Option<usize>,
+    pub mirror_deletions: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -37,6 +39,7 @@ pub struct Config {
     pub target: PathBuf,
     pub modify_window: Duration,
     pub jobs: usize,
+    pub mirror_deletions: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -110,6 +113,7 @@ pub fn resolve_backups(
             let tuning = Tuning {
                 modify_window_secs: entry.modify_window_secs.or(defaults.modify_window_secs),
                 jobs: entry.jobs.or(defaults.jobs),
+                mirror_deletions: entry.mirror_deletions.or(defaults.mirror_deletions),
             };
             let config = build(&entry.source, &entry.target, &tuning, home.as_deref())
                 .with_context(|| format!("backup '{name}'"))?;
@@ -124,12 +128,14 @@ pub fn resolve_backups(
 struct Tuning {
     modify_window_secs: Option<u64>,
     jobs: Option<usize>,
+    mirror_deletions: Option<bool>,
 }
 
 fn file_tuning(file: &FileConfig) -> Tuning {
     Tuning {
         modify_window_secs: file.modify_window_secs,
         jobs: file.jobs,
+        mirror_deletions: file.mirror_deletions,
     }
 }
 
@@ -166,6 +172,7 @@ fn build(source: &str, target: &str, tuning: &Tuning, home: Option<&str>) -> Res
                 .unwrap_or(DEFAULT_MODIFY_WINDOW_SECS),
         ),
         jobs,
+        mirror_deletions: tuning.mirror_deletions.unwrap_or(true),
     })
 }
 
@@ -590,6 +597,56 @@ mod tests {
     }
 
     #[test]
+    fn mirroring_deletions_is_on_by_default_and_can_be_turned_off_per_backup() {
+        // given
+        let file = parse(
+            r#"
+            [backup.mirror]
+            source = "/a"
+            target = "/b"
+
+            [backup.archive]
+            source = "/c"
+            target = "/d"
+            mirror_deletions = false
+        "#,
+        );
+
+        // when
+        let backups = resolve_backups(file, env_of(&[]), &[]).unwrap();
+
+        // then
+        let mirrored: Vec<bool> = backups.iter().map(|b| b.config.mirror_deletions).collect();
+        assert_eq!(mirrored, vec![true, false]);
+    }
+
+    #[test]
+    fn top_level_mirror_deletions_applies_to_every_backup_unless_overridden() {
+        // given
+        let file = parse(
+            r#"
+            mirror_deletions = false
+
+            [backup.archive]
+            source = "/a"
+            target = "/b"
+
+            [backup.mirror]
+            source = "/c"
+            target = "/d"
+            mirror_deletions = true
+        "#,
+        );
+
+        // when
+        let backups = resolve_backups(file, env_of(&[]), &[]).unwrap();
+
+        // then
+        let mirrored: Vec<bool> = backups.iter().map(|b| b.config.mirror_deletions).collect();
+        assert_eq!(mirrored, vec![false, true]);
+    }
+
+    #[test]
     fn default_config_path_prefers_xdg_config_home() {
         // given
         let env = env_of(&[("XDG_CONFIG_HOME", "/xdg"), ("HOME", "/Users/me")]);
@@ -668,6 +725,7 @@ mod tests {
             target: target.to_path_buf(),
             modify_window: Duration::from_secs(2),
             jobs: 4,
+            mirror_deletions: true,
         }
     }
 

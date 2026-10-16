@@ -11,6 +11,8 @@ use crate::scan::Entry;
 
 pub type Entries = HashMap<PathBuf, Entry>;
 
+pub const TEMP_PREFIX: &str = ".backsync-tmp";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Compare {
     Metadata { modify_window: Duration },
@@ -30,9 +32,22 @@ pub struct CopyAction {
     pub reason: CopyReason,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Removals {
+    All,
+    KeepDeleted,
+    None,
+}
+
+/**
+`remove` holds target entries deleted from the source. `replace` holds
+entries that must go even when deleted files are kept: entries whose type
+changed in the source, and temp files left by an interrupted run.
+*/
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Plan {
     pub remove: Vec<PathBuf>,
+    pub replace: Vec<PathBuf>,
     pub mkdir: Vec<PathBuf>,
     pub copy: Vec<CopyAction>,
     pub unchanged: usize,
@@ -40,7 +55,30 @@ pub struct Plan {
 
 impl Plan {
     pub fn is_empty(&self) -> bool {
-        self.remove.is_empty() && self.mkdir.is_empty() && self.copy.is_empty()
+        self.remove.is_empty()
+            && self.replace.is_empty()
+            && self.mkdir.is_empty()
+            && self.copy.is_empty()
+    }
+
+    pub fn removals(&self, mode: Removals) -> Vec<&Path> {
+        let removed: HashSet<&Path> = self.remove.iter().map(PathBuf::as_path).collect();
+        let mut paths: Vec<&Path> = match mode {
+            Removals::All => self
+                .remove
+                .iter()
+                .chain(
+                    self.replace
+                        .iter()
+                        .filter(|path| !path.ancestors().any(|a| removed.contains(a))),
+                )
+                .map(PathBuf::as_path)
+                .collect(),
+            Removals::KeepDeleted => self.replace.iter().map(PathBuf::as_path).collect(),
+            Removals::None => Vec::new(),
+        };
+        paths.sort();
+        paths
     }
 }
 
@@ -62,17 +100,23 @@ pub fn diff(
         .map(|(path, entry)| judge(path, entry, target.get(path), compare, &same_content))
         .collect();
 
+    let mut deleted = Vec::new();
+    let mut replaced = Vec::new();
+    for (path, entry) in target {
+        match source.get(path) {
+            Some(src) if discriminant(src) != discriminant(entry) => replaced.push(path.clone()),
+            Some(_) => {}
+            None if is_temp_file(path) => replaced.push(path.clone()),
+            None if !is_sidecar_of_mirrored_entry(path, source) => deleted.push(path.clone()),
+            None => {}
+        }
+    }
+    let replace = topmost(replaced);
+    let replaced: HashSet<&Path> = replace.iter().map(PathBuf::as_path).collect();
+    deleted.retain(|path| !path.ancestors().any(|a| replaced.contains(a)));
     let mut plan = Plan {
-        remove: topmost(
-            target
-                .iter()
-                .filter(|(path, entry)| match source.get(*path) {
-                    Some(src) => discriminant(src) != discriminant(*entry),
-                    None => !is_sidecar_of_mirrored_entry(path, source),
-                })
-                .map(|(path, _)| path.clone())
-                .collect(),
-        ),
+        remove: topmost(deleted),
+        replace,
         ..Plan::default()
     };
     for verdict in verdicts {
@@ -84,6 +128,7 @@ pub fn diff(
         }
     }
     plan.remove.sort();
+    plan.replace.sort();
     plan.mkdir.sort();
     plan.copy.sort_by(|a, b| a.path.cmp(&b.path));
     plan
@@ -162,6 +207,11 @@ fn is_sidecar_of_mirrored_entry(path: &Path, source: &Entries) -> bool {
         }
         _ => false,
     }
+}
+
+fn is_temp_file(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name.as_bytes().starts_with(TEMP_PREFIX.as_bytes()))
 }
 
 fn topmost(candidates: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -358,7 +408,8 @@ mod tests {
         let plan = diff(&source, &target, WINDOW, never_called);
 
         // then
-        assert_eq!(plan.remove, paths(&["was_dir", "was_file", "was_link"]));
+        assert_eq!(plan.replace, paths(&["was_dir", "was_file", "was_link"]));
+        assert!(plan.remove.is_empty());
         assert_eq!(plan.mkdir, paths(&["was_file"]));
         assert_eq!(
             copied(&plan),
@@ -367,6 +418,51 @@ mod tests {
                 ("was_link".into(), CopyReason::Changed)
             ]
         );
+    }
+
+    #[test]
+    fn temp_files_are_replaced_while_deleted_entries_are_removed() {
+        // given
+        let source = entries(&[("d", Entry::Dir)]);
+        let target = entries(&[
+            ("d", Entry::Dir),
+            ("d/.backsync-tmp.9.0", file(1, 1)),
+            ("gone", Entry::Dir),
+            ("gone/.backsync-tmp.9.1", file(1, 1)),
+        ]);
+
+        // when
+        let plan = diff(&source, &target, WINDOW, never_called);
+
+        // then
+        assert_eq!(plan.remove, paths(&["gone"]));
+        assert_eq!(
+            plan.replace,
+            paths(&["d/.backsync-tmp.9.0", "gone/.backsync-tmp.9.1"])
+        );
+    }
+
+    #[test]
+    fn removals_depend_on_the_mode() {
+        // given
+        let plan = Plan {
+            remove: paths(&["gone"]),
+            replace: paths(&["gone/.backsync-tmp.9.1", "x"]),
+            ..Plan::default()
+        };
+
+        // when
+        let all = plan.removals(Removals::All);
+        let keep_deleted = plan.removals(Removals::KeepDeleted);
+        let none = plan.removals(Removals::None);
+
+        // then
+        assert_eq!(all, [Path::new("gone"), Path::new("x")]);
+        assert_eq!(
+            keep_deleted,
+            [Path::new("gone/.backsync-tmp.9.1"), Path::new("x")]
+        );
+        assert!(none.is_empty());
     }
 
     #[test]
