@@ -10,6 +10,12 @@ $ backsync
 ## Install
 
 ```bash
+brew install shaunwen/tap/backsync
+```
+
+Or from a checkout:
+
+```bash
 make install            # lint, test, release build, copy to ~/workspace/bin
 make install BIN_DIR=~/bin
 ```
