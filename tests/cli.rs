@@ -174,6 +174,97 @@ fn files_and_folders_deleted_from_source_are_removed_from_backup() {
     assert_eq!(snapshot(&env.target()), snapshot(&env.source()));
 }
 
+fn keep_deleted_config(env: &Env) -> PathBuf {
+    let config = env.dir.path().join("keep.toml");
+    fs::write(&config, "mirror_deletions = false\n").unwrap();
+    config
+}
+
+#[test]
+fn files_deleted_from_source_are_kept_when_not_mirroring_deletions() {
+    // given
+    let env = Env::new();
+    sample_tree(&env.source());
+    env.sync().success();
+    let backed_up = snapshot(&env.target());
+    fs::remove_file(env.source().join("top.txt")).unwrap();
+    fs::remove_dir_all(env.source().join("docs")).unwrap();
+    write(&env.source(), "added.txt", "new");
+    let config = keep_deleted_config(&env);
+
+    // when
+    let assert = env.command().arg("--config").arg(&config).assert();
+
+    // then
+    assert
+        .success()
+        .stdout(contains("1 new, 0 updated, 0 removed"))
+        .stdout(contains("2 deleted from the source kept in the backup"));
+    let mut expected = backed_up;
+    expected.insert("added.txt".into(), Node::File(b"new".to_vec()));
+    assert_eq!(snapshot(&env.target()), expected);
+}
+
+#[test]
+fn type_changes_and_stale_temp_files_are_still_replaced_when_not_mirroring_deletions() {
+    // given
+    let env = Env::new();
+    write(&env.source(), "flip", "now a file");
+    write(&env.target(), "flip/old.txt", "was a folder");
+    write(&env.target(), ".backsync-tmp.123.0", "half written");
+    let config = keep_deleted_config(&env);
+
+    // when
+    let assert = env.command().arg("--config").arg(&config).assert();
+
+    // then
+    assert.success();
+    assert_eq!(snapshot(&env.target()), snapshot(&env.source()));
+}
+
+#[test]
+fn dry_run_without_mirroring_deletions_lists_no_removals() {
+    // given
+    let env = Env::new();
+    write(&env.target(), "stale.txt", "old");
+    write(&env.source(), "new.txt", "new");
+    let config = keep_deleted_config(&env);
+
+    // when
+    let assert = env
+        .command()
+        .arg("--config")
+        .arg(&config)
+        .arg("--dry-run")
+        .assert();
+
+    // then
+    assert
+        .success()
+        .stdout(contains("remove stale.txt").not())
+        .stdout(contains("would copy 1 new, update 0, remove 0"))
+        .stdout(contains("1 deleted from the source kept in the backup"));
+    assert!(env.target().join("stale.txt").exists());
+    assert!(!env.target().join("new.txt").exists());
+}
+
+#[test]
+fn empty_source_is_not_refused_when_not_mirroring_deletions() {
+    // given
+    let env = Env::new();
+    write(&env.target(), "kept.txt", "old");
+    let config = keep_deleted_config(&env);
+
+    // when
+    let assert = env.command().arg("--config").arg(&config).assert();
+
+    // then
+    assert
+        .success()
+        .stdout(contains("1 deleted from the source kept in the backup"));
+    assert!(env.target().join("kept.txt").exists());
+}
+
 #[test]
 fn source_is_never_modified() {
     // given
@@ -724,4 +815,44 @@ fn backups_named_on_the_command_line_run_in_that_order() {
     let books = output.find("[books] ").unwrap();
     assert!(photos < books, "photos must run before books:\n{output}");
     assert!(output.ends_with("photos ok, books ok\n"));
+}
+
+#[test]
+fn mirroring_deletions_can_be_turned_off_for_one_named_backup() {
+    // given
+    let library = Library::new();
+    library.command().assert().success();
+    let root = library.env.dir.path();
+    fs::write(
+        root.join("xdg/backsync/config.toml"),
+        format!(
+            "[backup.books]\nsource = {:?}\ntarget = {:?}\n\n\
+             [backup.photos]\nsource = {:?}\ntarget = {:?}\nmirror_deletions = false\n",
+            root.join("books"),
+            root.join("drive/books"),
+            root.join("photos"),
+            root.join("drive/photos"),
+        ),
+    )
+    .unwrap();
+    write(
+        &root.join("books"),
+        "other.txt",
+        "keeps the source non-empty",
+    );
+    write(
+        &root.join("photos"),
+        "other.txt",
+        "keeps the source non-empty",
+    );
+    fs::remove_file(root.join("books/item.txt")).unwrap();
+    fs::remove_file(root.join("photos/item.txt")).unwrap();
+
+    // when
+    let assert = library.command().assert();
+
+    // then
+    assert.success();
+    assert!(!library.backed_up("books"));
+    assert!(library.backed_up("photos"));
 }
